@@ -1,0 +1,2 @@
+[release_pr.version_updates]
+"Cargo.toml" = ["package.version"]

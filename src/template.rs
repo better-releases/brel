@@ -1,0 +1,132 @@
+use crate::config::Provider;
+use anyhow::{Context, Result, bail};
+use handlebars::{Handlebars, no_escape};
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowTemplate {
+    ReleasePr,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowRenderContext<'a> {
+    pub default_branch: &'a str,
+    pub release_pr_command: &'a str,
+    pub github_token_expr: &'a str,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasePrCommitContext<'a> {
+    pub sha_short: &'a str,
+    pub subject: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReleasePrBodyContext<'a> {
+    pub version: &'a str,
+    pub base_branch: &'a str,
+    pub release_branch: &'a str,
+    pub commits: &'a [ReleasePrCommitContext<'a>],
+}
+
+pub const MANAGED_RELEASE_PR_MARKER: &str = "<!-- managed-by: brel -->";
+
+const GITHUB_RELEASE_PR_TEMPLATE: &str =
+    include_str!("../templates/workflows/github/release-pr.yml.hbs");
+const DEFAULT_RELEASE_PR_BODY_TEMPLATE: &str = r#"<!-- managed-by: brel -->
+## Release v{{version}}
+
+Base branch: `{{base_branch}}`
+Release branch: `{{release_branch}}`
+
+### Included commits
+{{#if commits}}
+{{#each commits}}
+- {{subject}} ({{sha_short}})
+{{/each}}
+{{else}}
+- No commit summaries available.
+{{/if}}
+"#;
+
+pub fn render_workflow(
+    provider: Provider,
+    template: WorkflowTemplate,
+    context: &WorkflowRenderContext<'_>,
+) -> Result<String> {
+    match (provider, template) {
+        (Provider::Github, WorkflowTemplate::ReleasePr) => {
+            render_template("github-release-pr", GITHUB_RELEASE_PR_TEMPLATE, context)
+        }
+        (provider, _) => bail!(
+            "Provider `{}` is not supported by workflow renderer in v1.",
+            provider.as_str()
+        ),
+    }
+}
+
+pub fn render_release_pr_body(
+    context: &ReleasePrBodyContext<'_>,
+    template_override: Option<&str>,
+) -> Result<String> {
+    let template = template_override.unwrap_or(DEFAULT_RELEASE_PR_BODY_TEMPLATE);
+    render_template("release-pr-body", template, context)
+}
+
+fn render_template<T: Serialize>(name: &str, template_source: &str, context: &T) -> Result<String> {
+    let mut handlebars = Handlebars::new();
+    handlebars.register_escape_fn(no_escape);
+    handlebars
+        .register_template_string(name, template_source)
+        .with_context(|| format!("Failed to register template `{name}`."))?;
+
+    handlebars
+        .render(name, context)
+        .with_context(|| format!("Failed to render template `{name}`."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_github_template_with_branch_and_release_command() {
+        let rendered = render_workflow(
+            Provider::Github,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr --config custom.toml",
+                github_token_expr: "${{ github.token }}",
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("# managed-by: brel"));
+        assert!(rendered.contains("- main"));
+        assert!(rendered.contains("run: brel release-pr --config custom.toml"));
+        assert!(rendered.contains("GH_TOKEN: ${{ github.token }}"));
+    }
+
+    #[test]
+    fn renders_default_release_pr_body_template() {
+        let commits = [ReleasePrCommitContext {
+            sha_short: "abc1234",
+            subject: "feat: add feature",
+        }];
+        let rendered = render_release_pr_body(
+            &ReleasePrBodyContext {
+                version: "1.2.3",
+                base_branch: "main",
+                release_branch: "brel/release/v1.2.3",
+                commits: &commits,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(rendered.contains(MANAGED_RELEASE_PR_MARKER));
+        assert!(rendered.contains("Release v1.2.3"));
+        assert!(rendered.contains("feat: add feature"));
+    }
+}

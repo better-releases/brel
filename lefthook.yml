@@ -1,0 +1,14 @@
+pre-commit:
+  parallel: false
+  jobs:
+    - name: rustfmt
+      run: cargo fmt --all -- --check
+      stage_fixed: true
+
+    - name: clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      stage_fixed: true
+
+    - name: cargo-check
+      run: cargo check --all-targets --all-features
+      stage_fixed: true

@@ -1,0 +1,52 @@
+# managed-by: brel
+name: Release PR
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install brel (latest release)
+        env:
+          BREL_RELEASE_REPO: better-releases/brel
+        run: |
+          set -euo pipefail
+
+          release_json="$(curl -fsSL "https://api.github.com/repos/${BREL_RELEASE_REPO}/releases/latest")"
+          asset_url="$(echo "${release_json}" | jq -r '.assets[] | select(.name | test("x86_64-unknown-linux-musl")) | .browser_download_url' | head -n1)"
+
+          if [ -z "${asset_url}" ] || [ "${asset_url}" = "null" ]; then
+            echo "Could not find a Linux x86_64 asset for latest brel release." >&2
+            exit 1
+          fi
+
+          archive_path="${RUNNER_TEMP}/brel.tar.gz"
+          curl -fsSL "${asset_url}" -o "${archive_path}"
+          tar -xzf "${archive_path}" -C "${RUNNER_TEMP}"
+
+          brel_bin="$(find "${RUNNER_TEMP}" -type f -name brel | head -n1)"
+          if [ -z "${brel_bin}" ]; then
+            echo "Unable to locate brel binary after extraction." >&2
+            exit 1
+          fi
+
+          chmod +x "${brel_bin}"
+          cp "${brel_bin}" "${RUNNER_TEMP}/brel"
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      - name: Generate release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: brel release-pr
