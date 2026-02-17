@@ -2,6 +2,14 @@
 name = "brel"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/better-releases/brel"
+description = "better-releases cli tool"
+license = "MIT"
+homepage = "https://better-releases.com"
+readme = "README.md"
+exclude = [
+    "brel.toml"
+]
 
 [dependencies]
 anyhow = "1.0.97"
