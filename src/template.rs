@@ -111,6 +111,9 @@ mod tests {
         assert!(rendered.contains("run: brel release-pr --config custom.toml"));
         assert!(rendered.contains("GH_TOKEN: ${{ github.token }}"));
         assert!(rendered.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(rendered.contains("archive asset (.tar.gz, .tar.xz, .zip)"));
+        assert!(rendered.contains("tar -xaf"));
+        assert!(!rendered.contains("tar -xzf"));
     }
 
     #[test]
