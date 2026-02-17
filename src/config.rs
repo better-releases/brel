@@ -10,6 +10,7 @@ pub const DEFAULT_WORKFLOW_FILE: &str = "release-pr.yml";
 pub const DEFAULT_RELEASE_BRANCH_PATTERN: &str = "brel/release/v{{version}}";
 pub const DEFAULT_COMMIT_AUTHOR_NAME: &str = "brel[bot]";
 pub const DEFAULT_COMMIT_AUTHOR_EMAIL: &str = "brel[bot]@users.noreply.github.com";
+pub const DEFAULT_CHANGELOG_OUTPUT_FILE: &str = "CHANGELOG.md";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -103,12 +104,19 @@ pub struct CommitAuthorConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelogConfig {
+    pub enabled: bool,
+    pub output_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleasePrConfig {
     pub version_updates: BTreeMap<String, Vec<String>>,
     pub format_overrides: BTreeMap<String, VersionFileFormat>,
     pub release_branch_pattern: String,
     pub pr_template_file: Option<String>,
     pub commit_author: CommitAuthorConfig,
+    pub changelog: ChangelogConfig,
 }
 
 impl Default for ReleasePrConfig {
@@ -121,6 +129,10 @@ impl Default for ReleasePrConfig {
             commit_author: CommitAuthorConfig {
                 name: DEFAULT_COMMIT_AUTHOR_NAME.to_string(),
                 email: DEFAULT_COMMIT_AUTHOR_EMAIL.to_string(),
+            },
+            changelog: ChangelogConfig {
+                enabled: true,
+                output_file: DEFAULT_CHANGELOG_OUTPUT_FILE.to_string(),
             },
         }
     }
@@ -151,12 +163,19 @@ struct RawReleasePrConfig {
     release_branch_pattern: Option<String>,
     pr_template_file: Option<String>,
     commit_author: Option<RawCommitAuthorConfig>,
+    changelog: Option<RawChangelogConfig>,
 }
 
 #[derive(Debug, Default, facet::Facet)]
 struct RawCommitAuthorConfig {
     name: Option<String>,
     email: Option<String>,
+}
+
+#[derive(Debug, Default, facet::Facet)]
+struct RawChangelogConfig {
+    enabled: Option<bool>,
+    output_file: Option<String>,
 }
 
 pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> {
@@ -318,6 +337,16 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         bail!("`release_pr.commit_author.email` cannot be empty.");
     }
 
+    let raw_changelog = raw_release_pr.changelog.unwrap_or_default();
+    let changelog_enabled = raw_changelog.enabled.unwrap_or(true);
+    let changelog_output_file = normalize_repo_relative_path(
+        raw_changelog
+            .output_file
+            .as_deref()
+            .unwrap_or(DEFAULT_CHANGELOG_OUTPUT_FILE),
+        "`release_pr.changelog.output_file` path",
+    )?;
+
     Ok(ReleasePrConfig {
         version_updates,
         format_overrides,
@@ -326,6 +355,10 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         commit_author: CommitAuthorConfig {
             name: commit_author_name,
             email: commit_author_email,
+        },
+        changelog: ChangelogConfig {
+            enabled: changelog_enabled,
+            output_file: changelog_output_file,
         },
     })
 }
@@ -419,6 +452,7 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
         "release_branch_pattern",
         "pr_template_file",
         "commit_author",
+        "changelog",
     ]);
     for key in release_pr
         .keys()
@@ -433,7 +467,7 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
         .get("commit_author")
         .and_then(toml::Value::as_table)
     else {
-        return warnings;
+        return collect_changelog_warnings(release_pr, warnings);
     };
 
     let allowed_author: BTreeSet<&str> = BTreeSet::from(["name", "email"]);
@@ -443,6 +477,27 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
     {
         warnings.push(format!(
             "Unknown config key `release_pr.commit_author.{key}` was ignored."
+        ));
+    }
+
+    collect_changelog_warnings(release_pr, warnings)
+}
+
+fn collect_changelog_warnings(
+    release_pr: &toml::value::Table,
+    mut warnings: Vec<String>,
+) -> Vec<String> {
+    let Some(changelog) = release_pr.get("changelog").and_then(toml::Value::as_table) else {
+        return warnings;
+    };
+
+    let allowed_changelog: BTreeSet<&str> = BTreeSet::from(["enabled", "output_file"]);
+    for key in changelog
+        .keys()
+        .filter(|key| !allowed_changelog.contains(key.as_str()))
+    {
+        warnings.push(format!(
+            "Unknown config key `release_pr.changelog.{key}` was ignored."
         ));
     }
 
@@ -519,6 +574,11 @@ mod tests {
             DEFAULT_RELEASE_BRANCH_PATTERN
         );
         assert_eq!(config.release_pr.version_updates.len(), 0);
+        assert!(config.release_pr.changelog.enabled);
+        assert_eq!(
+            config.release_pr.changelog.output_file,
+            DEFAULT_CHANGELOG_OUTPUT_FILE
+        );
         assert!(matches!(config.source, ConfigSource::Defaulted));
     }
 
@@ -599,6 +659,30 @@ email = "release@example.com"
         );
         assert_eq!(config.release_pr.commit_author.name, "release bot");
         assert_eq!(config.release_pr.commit_author.email, "release@example.com");
+        assert!(config.release_pr.changelog.enabled);
+        assert_eq!(
+            config.release_pr.changelog.output_file,
+            DEFAULT_CHANGELOG_OUTPUT_FILE
+        );
+    }
+
+    #[test]
+    fn parses_release_pr_changelog_settings() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog]
+enabled = false
+output_file = "docs/changelog.md"
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert!(!config.release_pr.changelog.enabled);
+        assert_eq!(config.release_pr.changelog.output_file, "docs/changelog.md");
     }
 
     #[test]
@@ -655,12 +739,15 @@ foo = "bar"
 name = "brel[bot]"
 email = "brel@example.com"
 extra = "x"
+
+[release_pr.changelog]
+wat = true
 "#,
         )
         .unwrap();
 
         let config = load(None, cwd).unwrap();
-        assert_eq!(config.warnings.len(), 2);
+        assert_eq!(config.warnings.len(), 3);
         assert!(
             config
                 .warnings
@@ -673,6 +760,12 @@ extra = "x"
                 .iter()
                 .any(|warning| warning.contains("release_pr.commit_author.extra"))
         );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("release_pr.changelog.wat"))
+        );
     }
 
     #[test]
@@ -684,6 +777,23 @@ extra = "x"
             r#"
 [release_pr.version_updates]
 "../package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+
+        let err = load(None, cwd).unwrap_err();
+        assert!(err.to_string().contains("cannot contain `..`"));
+    }
+
+    #[test]
+    fn rejects_parent_segments_in_changelog_output_path() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog]
+output_file = "../CHANGELOG.md"
 "#,
         )
         .unwrap();

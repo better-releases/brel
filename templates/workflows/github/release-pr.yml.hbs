@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install brel (latest release)
         env:
@@ -46,6 +48,14 @@ jobs:
           cp "${brel_bin}" "${RUNNER_TEMP}/brel"
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
+{{#if changelog_enabled}}
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --output {{changelog_output_file}}
+
+{{/if}}
       - name: Generate release PR
         env:
           GH_TOKEN: {{github_token_expr}}

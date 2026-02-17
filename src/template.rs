@@ -13,6 +13,8 @@ pub struct WorkflowRenderContext<'a> {
     pub default_branch: &'a str,
     pub release_pr_command: &'a str,
     pub github_token_expr: &'a str,
+    pub changelog_enabled: bool,
+    pub changelog_output_file: &'a str,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,8 @@ mod tests {
                 default_branch: "main",
                 release_pr_command: "brel release-pr --config custom.toml",
                 github_token_expr: "${{ github.token }}",
+                changelog_enabled: true,
+                changelog_output_file: "CHANGELOG.md",
             },
         )
         .unwrap();
@@ -106,6 +110,25 @@ mod tests {
         assert!(rendered.contains("- main"));
         assert!(rendered.contains("run: brel release-pr --config custom.toml"));
         assert!(rendered.contains("GH_TOKEN: ${{ github.token }}"));
+        assert!(rendered.contains("uses: orhun/git-cliff-action@v4"));
+    }
+
+    #[test]
+    fn can_disable_github_changelog_step() {
+        let rendered = render_workflow(
+            Provider::Github,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                github_token_expr: "${{ github.token }}",
+                changelog_enabled: false,
+                changelog_output_file: "CHANGELOG.md",
+            },
+        )
+        .unwrap();
+
+        assert!(!rendered.contains("uses: orhun/git-cliff-action@v4"));
     }
 
     #[test]

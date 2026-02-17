@@ -46,6 +46,10 @@ default_branch = "main"
 release_branch_pattern = "brel/release/v{{version}}"
 pr_template_file = ".github/brel/release-pr-body.hbs"
 
+[release_pr.changelog]
+enabled = true
+output_file = "CHANGELOG.md"
+
 [release_pr.commit_author]
 name = "brel[bot]"
 email = "brel[bot]@users.noreply.github.com"
@@ -81,6 +85,22 @@ Example key paths:
 
 - JSON: `"package.json" = ["version", "tooling.release.version"]`
 - TOML: `"Cargo.toml" = ["package.version"]`
+
+## Changelog Generation (`git-cliff`)
+
+- `brel init` generates a workflow that runs [`orhun/git-cliff-action@v4`](https://github.com/orhun/git-cliff-action) by default.
+- Configure changelog behavior with `[release_pr.changelog]`:
+  - `enabled` (default `true`)
+  - `output_file` (default `"CHANGELOG.md"`)
+- If changelog generation is enabled, `brel release-pr` stages `output_file` in the release commit when that file exists.
+- Disable changelog generation:
+
+```toml
+[release_pr.changelog]
+enabled = false
+```
+
+- `brel init` does not create or manage `cliff.toml`; keep that file in your repository if you want custom `git-cliff` rules.
 
 ## Branch / Commit / PR Behavior
 

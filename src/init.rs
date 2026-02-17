@@ -117,6 +117,8 @@ pub(crate) fn run_with_interactor(
             default_branch: &selected_branch,
             release_pr_command: &release_pr_command,
             github_token_expr: "${{ github.token }}",
+            changelog_enabled: config.release_pr.changelog.enabled,
+            changelog_output_file: &config.release_pr.changelog.output_file,
         },
     )?;
 
@@ -359,6 +361,28 @@ mod tests {
         let content = fs::read_to_string(workflow).unwrap();
         assert!(content.contains("# managed-by: brel"));
         assert!(content.contains("- main"));
+        assert!(content.contains("fetch-depth: 0"));
+        assert!(content.contains("uses: orhun/git-cliff-action@v4"));
+    }
+
+    #[test]
+    fn changelog_step_can_be_disabled() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.changelog]
+enabled = false
+"#,
+        )
+        .unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+        let content = fs::read_to_string(workflow).unwrap();
+        assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
     }
 
     #[test]

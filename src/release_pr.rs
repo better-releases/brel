@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn run(args: ReleasePrArgs) -> Result<()> {
@@ -83,7 +83,9 @@ pub(crate) fn run_with_runner(
         });
 
     git_checkout_branch(runner, repo_root, &release_branch)?;
-    git_add_files(runner, repo_root, &update_report.changed_files)?;
+    let mut files_to_stage = update_report.changed_files.clone();
+    maybe_append_changelog_file(repo_root, &config.release_pr, &mut files_to_stage);
+    git_add_files(runner, repo_root, &files_to_stage)?;
     if !git_has_staged_changes(runner, repo_root)? {
         println!("No staged changes after version updates. Skipping release PR.");
         return Ok(());
@@ -446,6 +448,26 @@ fn git_add_files(
         "Failed to stage version update files.",
     )?;
     Ok(())
+}
+
+fn maybe_append_changelog_file(
+    repo_root: &Path,
+    release_pr: &ReleasePrConfig,
+    files_to_stage: &mut Vec<PathBuf>,
+) {
+    if !release_pr.changelog.enabled {
+        return;
+    }
+
+    let changelog_relative = PathBuf::from(&release_pr.changelog.output_file);
+    if files_to_stage.contains(&changelog_relative) {
+        return;
+    }
+
+    let changelog_full_path = repo_root.join(&changelog_relative);
+    if changelog_full_path.is_file() {
+        files_to_stage.push(changelog_relative);
+    }
 }
 
 fn git_has_staged_changes(runner: &mut dyn CommandRunner, repo_root: &Path) -> Result<bool> {
@@ -1068,5 +1090,92 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
                 .iter()
                 .any(|(key, value)| key == "GH_TOKEN" && value == "abc-token")
         }));
+    }
+
+    #[test]
+    fn stages_changelog_file_when_enabled_and_present() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("CHANGELOG.md"), "# Changelog\n").unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "fix: patch", "")),
+            ok("[]"),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("abc-token")).unwrap();
+
+        let add_call = runner
+            .calls
+            .iter()
+            .find(|call| call.program == "git" && call.args.first() == Some(&"add".to_string()))
+            .expect("missing git add call");
+
+        assert!(add_call.args.contains(&"package.json".to_string()));
+        assert!(add_call.args.contains(&"CHANGELOG.md".to_string()));
+    }
+
+    #[test]
+    fn does_not_stage_changelog_file_when_disabled() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.changelog]
+enabled = false
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("CHANGELOG.md"), "# Changelog\n").unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "fix: patch", "")),
+            ok("[]"),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("abc-token")).unwrap();
+
+        let add_call = runner
+            .calls
+            .iter()
+            .find(|call| call.program == "git" && call.args.first() == Some(&"add".to_string()))
+            .expect("missing git add call");
+
+        assert!(add_call.args.contains(&"package.json".to_string()));
+        assert!(!add_call.args.contains(&"CHANGELOG.md".to_string()));
     }
 }
