@@ -6,6 +6,13 @@ on:
   push:
     branches:
       - {{default_branch}}
+{{#if tagging_enabled}}
+  pull_request:
+    types:
+      - closed
+    branches:
+      - {{default_branch}}
+{{/if}}
 
 permissions:
   contents: write
@@ -13,6 +20,7 @@ permissions:
 
 jobs:
   release-pr:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -73,3 +81,49 @@ jobs:
         env:
           GH_TOKEN: {{github_token_expr}}
         run: {{release_pr_command}}
+{{#if tagging_enabled}}
+
+  release-tag:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release tag
+        run: |
+          set -euo pipefail
+
+          pr_title="$(jq -r '.pull_request.title // ""' "${GITHUB_EVENT_PATH}")"
+          pr_body="$(jq -r '.pull_request.body // ""' "${GITHUB_EVENT_PATH}")"
+          merge_commit_sha="$(jq -r '.pull_request.merge_commit_sha // ""' "${GITHUB_EVENT_PATH}")"
+
+          if ! printf '%s' "${pr_body}" | grep -Fq '<!-- managed-by: brel -->'; then
+            echo "PR is not managed by brel. Skipping tag creation."
+            exit 0
+          fi
+
+          version="$(printf '%s' "${pr_title}" | sed -nE 's/^Release v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
+          if [ -z "${version}" ]; then
+            echo "PR title does not match expected release format. Skipping tag creation."
+            exit 0
+          fi
+
+          if [ -z "${merge_commit_sha}" ]; then
+            echo "Missing merge commit SHA. Skipping tag creation."
+            exit 0
+          fi
+
+          tag="v${version}"
+          git fetch --tags origin
+          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists. Skipping."
+            exit 0
+          fi
+
+          git tag "${tag}" "${merge_commit_sha}"
+          git push origin "refs/tags/${tag}"
+          echo "Created and pushed tag ${tag} at ${merge_commit_sha}."
+{{/if}}

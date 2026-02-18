@@ -57,6 +57,7 @@ fn init_without_config_creates_default_workflow() {
     assert!(content.contains("GH_TOKEN: ${{ github.token }}"));
     assert!(content.contains("uses: orhun/git-cliff-action@v4"));
     assert!(content.contains("run: brel release-pr"));
+    assert!(!content.contains("pull_request:"));
 }
 
 #[test]
@@ -80,6 +81,31 @@ enabled = false
     let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
     let content = fs::read_to_string(workflow).unwrap();
     assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+}
+
+#[test]
+fn init_with_enabled_tagging_adds_tag_job() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.tagging]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes"])
+        .assert()
+        .success();
+
+    let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+    let content = fs::read_to_string(workflow).unwrap();
+    assert!(content.contains("pull_request:"));
+    assert!(content.contains("- closed"));
+    assert!(content.contains("Create release tag"));
 }
 
 #[test]

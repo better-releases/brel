@@ -11,6 +11,7 @@ pub const DEFAULT_RELEASE_BRANCH_PATTERN: &str = "brel/release/v{{version}}";
 pub const DEFAULT_COMMIT_AUTHOR_NAME: &str = "brel[bot]";
 pub const DEFAULT_COMMIT_AUTHOR_EMAIL: &str = "brel[bot]@users.noreply.github.com";
 pub const DEFAULT_CHANGELOG_OUTPUT_FILE: &str = "CHANGELOG.md";
+pub const DEFAULT_TAGGING_ENABLED: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -110,6 +111,11 @@ pub struct ChangelogConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggingConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleasePrConfig {
     pub version_updates: BTreeMap<String, Vec<String>>,
     pub format_overrides: BTreeMap<String, VersionFileFormat>,
@@ -117,6 +123,7 @@ pub struct ReleasePrConfig {
     pub pr_template_file: Option<String>,
     pub commit_author: CommitAuthorConfig,
     pub changelog: ChangelogConfig,
+    pub tagging: TaggingConfig,
 }
 
 impl Default for ReleasePrConfig {
@@ -133,6 +140,9 @@ impl Default for ReleasePrConfig {
             changelog: ChangelogConfig {
                 enabled: true,
                 output_file: DEFAULT_CHANGELOG_OUTPUT_FILE.to_string(),
+            },
+            tagging: TaggingConfig {
+                enabled: DEFAULT_TAGGING_ENABLED,
             },
         }
     }
@@ -164,6 +174,7 @@ struct RawReleasePrConfig {
     pr_template_file: Option<String>,
     commit_author: Option<RawCommitAuthorConfig>,
     changelog: Option<RawChangelogConfig>,
+    tagging: Option<RawTaggingConfig>,
 }
 
 #[derive(Debug, Default, facet::Facet)]
@@ -176,6 +187,11 @@ struct RawCommitAuthorConfig {
 struct RawChangelogConfig {
     enabled: Option<bool>,
     output_file: Option<String>,
+}
+
+#[derive(Debug, Default, facet::Facet)]
+struct RawTaggingConfig {
+    enabled: Option<bool>,
 }
 
 pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> {
@@ -346,6 +362,8 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
             .unwrap_or(DEFAULT_CHANGELOG_OUTPUT_FILE),
         "`release_pr.changelog.output_file` path",
     )?;
+    let raw_tagging = raw_release_pr.tagging.unwrap_or_default();
+    let tagging_enabled = raw_tagging.enabled.unwrap_or(DEFAULT_TAGGING_ENABLED);
 
     Ok(ReleasePrConfig {
         version_updates,
@@ -359,6 +377,9 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         changelog: ChangelogConfig {
             enabled: changelog_enabled,
             output_file: changelog_output_file,
+        },
+        tagging: TaggingConfig {
+            enabled: tagging_enabled,
         },
     })
 }
@@ -453,6 +474,7 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
         "pr_template_file",
         "commit_author",
         "changelog",
+        "tagging",
     ]);
     for key in release_pr
         .keys()
@@ -467,7 +489,7 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
         .get("commit_author")
         .and_then(toml::Value::as_table)
     else {
-        return collect_changelog_warnings(release_pr, warnings);
+        return collect_release_pr_nested_warnings(release_pr, warnings);
     };
 
     let allowed_author: BTreeSet<&str> = BTreeSet::from(["name", "email"]);
@@ -480,25 +502,35 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
         ));
     }
 
-    collect_changelog_warnings(release_pr, warnings)
+    collect_release_pr_nested_warnings(release_pr, warnings)
 }
 
-fn collect_changelog_warnings(
+fn collect_release_pr_nested_warnings(
     release_pr: &toml::value::Table,
     mut warnings: Vec<String>,
 ) -> Vec<String> {
-    let Some(changelog) = release_pr.get("changelog").and_then(toml::Value::as_table) else {
-        return warnings;
-    };
+    if let Some(changelog) = release_pr.get("changelog").and_then(toml::Value::as_table) {
+        let allowed_changelog: BTreeSet<&str> = BTreeSet::from(["enabled", "output_file"]);
+        for key in changelog
+            .keys()
+            .filter(|key| !allowed_changelog.contains(key.as_str()))
+        {
+            warnings.push(format!(
+                "Unknown config key `release_pr.changelog.{key}` was ignored."
+            ));
+        }
+    }
 
-    let allowed_changelog: BTreeSet<&str> = BTreeSet::from(["enabled", "output_file"]);
-    for key in changelog
-        .keys()
-        .filter(|key| !allowed_changelog.contains(key.as_str()))
-    {
-        warnings.push(format!(
-            "Unknown config key `release_pr.changelog.{key}` was ignored."
-        ));
+    if let Some(tagging) = release_pr.get("tagging").and_then(toml::Value::as_table) {
+        let allowed_tagging: BTreeSet<&str> = BTreeSet::from(["enabled"]);
+        for key in tagging
+            .keys()
+            .filter(|key| !allowed_tagging.contains(key.as_str()))
+        {
+            warnings.push(format!(
+                "Unknown config key `release_pr.tagging.{key}` was ignored."
+            ));
+        }
     }
 
     warnings
@@ -579,6 +611,7 @@ mod tests {
             config.release_pr.changelog.output_file,
             DEFAULT_CHANGELOG_OUTPUT_FILE
         );
+        assert!(!config.release_pr.tagging.enabled);
         assert!(matches!(config.source, ConfigSource::Defaulted));
     }
 
@@ -664,6 +697,7 @@ email = "release@example.com"
             config.release_pr.changelog.output_file,
             DEFAULT_CHANGELOG_OUTPUT_FILE
         );
+        assert!(!config.release_pr.tagging.enabled);
     }
 
     #[test]
@@ -683,6 +717,23 @@ output_file = "docs/changelog.md"
         let config = load(None, cwd).unwrap();
         assert!(!config.release_pr.changelog.enabled);
         assert_eq!(config.release_pr.changelog.output_file, "docs/changelog.md");
+    }
+
+    #[test]
+    fn parses_release_pr_tagging_settings() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert!(config.release_pr.tagging.enabled);
     }
 
     #[test]
@@ -742,12 +793,15 @@ extra = "x"
 
 [release_pr.changelog]
 wat = true
+
+[release_pr.tagging]
+extra = 1
 "#,
         )
         .unwrap();
 
         let config = load(None, cwd).unwrap();
-        assert_eq!(config.warnings.len(), 3);
+        assert_eq!(config.warnings.len(), 4);
         assert!(
             config
                 .warnings
@@ -765,6 +819,12 @@ wat = true
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("release_pr.changelog.wat"))
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("release_pr.tagging.extra"))
         );
     }
 

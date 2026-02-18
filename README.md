@@ -50,6 +50,9 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
 enabled = true
 output_file = "CHANGELOG.md"
 
+[release_pr.tagging]
+enabled = false
+
 [release_pr.commit_author]
 name = "brel[bot]"
 email = "brel[bot]@users.noreply.github.com"
@@ -117,6 +120,12 @@ For PRs:
 - `brel` uses `gh pr list` to find an open managed release PR.
 - If found, it updates that PR (continuity wins over recomputing branch name).
 - If not found, it creates a new PR.
+
+## Tagging on Merge
+
+- Optional config: `[release_pr.tagging] enabled = true` (default `false`).
+- When enabled, the generated workflow listens for merged pull requests into the configured default branch.
+- If the merged PR is managed by `brel` and titled `Release vX.Y.Z`, the workflow creates and pushes the tag `vX.Y.Z` when it does not already exist.
 
 ## PR Body Templates
 

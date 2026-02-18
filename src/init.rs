@@ -119,6 +119,7 @@ pub(crate) fn run_with_interactor(
             github_token_expr: "${{ github.token }}",
             changelog_enabled: config.release_pr.changelog.enabled,
             changelog_output_file: &config.release_pr.changelog.output_file,
+            tagging_enabled: config.release_pr.tagging.enabled,
         },
     )?;
 
@@ -363,6 +364,7 @@ mod tests {
         assert!(content.contains("- main"));
         assert!(content.contains("fetch-depth: 0"));
         assert!(content.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!content.contains("pull_request:"));
     }
 
     #[test]
@@ -383,6 +385,28 @@ enabled = false
         let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
         let content = fs::read_to_string(workflow).unwrap();
         assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+    }
+
+    #[test]
+    fn tagging_step_can_be_enabled() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+        let content = fs::read_to_string(workflow).unwrap();
+        assert!(content.contains("pull_request:"));
+        assert!(content.contains("Create release tag"));
+        assert!(content.contains("if: github.event_name == 'pull_request'"));
     }
 
     #[test]

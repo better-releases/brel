@@ -15,6 +15,7 @@ pub struct WorkflowRenderContext<'a> {
     pub github_token_expr: &'a str,
     pub changelog_enabled: bool,
     pub changelog_output_file: &'a str,
+    pub tagging_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,7 @@ mod tests {
                 github_token_expr: "${{ github.token }}",
                 changelog_enabled: true,
                 changelog_output_file: "CHANGELOG.md",
+                tagging_enabled: false,
             },
         )
         .unwrap();
@@ -114,6 +116,8 @@ mod tests {
         assert!(rendered.contains("archive asset (.tar.gz, .tar.xz, .zip)"));
         assert!(rendered.contains("tar -xaf"));
         assert!(!rendered.contains("tar -xzf"));
+        assert!(!rendered.contains("Create release tag"));
+        assert!(!rendered.contains("pull_request:"));
     }
 
     #[test]
@@ -127,11 +131,34 @@ mod tests {
                 github_token_expr: "${{ github.token }}",
                 changelog_enabled: false,
                 changelog_output_file: "CHANGELOG.md",
+                tagging_enabled: false,
             },
         )
         .unwrap();
 
         assert!(!rendered.contains("uses: orhun/git-cliff-action@v4"));
+    }
+
+    #[test]
+    fn can_enable_github_tagging_step() {
+        let rendered = render_workflow(
+            Provider::Github,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                github_token_expr: "${{ github.token }}",
+                changelog_enabled: true,
+                changelog_output_file: "CHANGELOG.md",
+                tagging_enabled: true,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("Create release tag"));
+        assert!(rendered.contains("if: github.event_name == 'pull_request'"));
+        assert!(rendered.contains("types:"));
+        assert!(rendered.contains("- closed"));
     }
 
     #[test]

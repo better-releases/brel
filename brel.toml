@@ -1,2 +1,5 @@
 [release_pr.version_updates]
 "Cargo.toml" = ["package.version"]
+
+[release_pr.tagging]
+enabled = true
