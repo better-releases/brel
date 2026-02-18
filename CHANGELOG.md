@@ -1,5 +1,10 @@
 ## [unreleased]
 
+### 🚀 Features
+
+- Tag after release
+## [0.1.2] - 2026-02-18
+
 ### 🐛 Bug Fixes
 
 - Brel release resolution
