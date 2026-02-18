@@ -1,8 +1,26 @@
-## [unreleased]
+## [0.3.0] - 2026-02-18
+
+### 🚀 Features
+
+- Version_selector dsl
+
+### 💼 Other
+
+- Cargo release
+## [0.2.0] - 2026-02-18
 
 ### 🚀 Features
 
 - Tag after release
+- Tag templating
+
+### 🐛 Bug Fixes
+
+- Changelog generation tag
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* V0.2.0
 ## [0.1.2] - 2026-02-18
 
 ### 🐛 Bug Fixes
