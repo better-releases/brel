@@ -1,6 +1,7 @@
 use crate::tag_template;
 use crate::version_selector;
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -162,7 +163,7 @@ pub struct ResolvedConfig {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, facet::Facet)]
+#[derive(Debug, Deserialize)]
 struct RawConfig {
     provider: Option<String>,
     default_branch: Option<String>,
@@ -170,7 +171,7 @@ struct RawConfig {
     release_pr: Option<RawReleasePrConfig>,
 }
 
-#[derive(Debug, Default, facet::Facet)]
+#[derive(Debug, Default, Deserialize)]
 struct RawReleasePrConfig {
     version_updates: Option<BTreeMap<String, Vec<String>>>,
     format_overrides: Option<BTreeMap<String, String>>,
@@ -181,19 +182,19 @@ struct RawReleasePrConfig {
     tagging: Option<RawTaggingConfig>,
 }
 
-#[derive(Debug, Default, facet::Facet)]
+#[derive(Debug, Default, Deserialize)]
 struct RawCommitAuthorConfig {
     name: Option<String>,
     email: Option<String>,
 }
 
-#[derive(Debug, Default, facet::Facet)]
+#[derive(Debug, Default, Deserialize)]
 struct RawChangelogConfig {
     enabled: Option<bool>,
     output_file: Option<String>,
 }
 
-#[derive(Debug, Default, facet::Facet)]
+#[derive(Debug, Default, Deserialize)]
 struct RawTaggingConfig {
     enabled: Option<bool>,
     tag_template: Option<String>,
@@ -231,7 +232,7 @@ pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> 
     })?;
     let warnings = collect_warnings(&parsed_toml);
 
-    let raw: RawConfig = facet_toml::from_str(&raw_contents).with_context(|| {
+    let raw: RawConfig = toml::from_str(&raw_contents).with_context(|| {
         let path = source.path().expect("config source always has path");
         format!(
             "Config file `{}` has unsupported value types.",

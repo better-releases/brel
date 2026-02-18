@@ -79,7 +79,7 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --unreleased --tag v${{ steps.next-version.outputs.version }} --output CHANGELOG.md
+          args: --unreleased --tag ${{ steps.next-version.outputs.version }} --output CHANGELOG.md
 
       - name: Generate release PR
         env:
@@ -114,7 +114,7 @@ jobs:
             exit 0
           fi
 
-          prefix=v
+          prefix=''
           suffix=''
 
           if [ -n "${prefix}" ] && [[ "${tag}" != "${prefix}"* ]]; then
