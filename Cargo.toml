@@ -1,19 +1,5 @@
-[package]
-name = "brel"
-version = "0.1.1"
-edition = "2024"
-repository = "https://github.com/better-releases/brel"
-description = "better-releases cli tool"
-license = "MIT"
-homepage = "https://better-releases.com"
-readme = "README.md"
-exclude = [
-    "brel.toml"
-]
-
 [dependencies]
 anyhow = "1.0.97"
-clap = { version = "4.5.31", features = ["derive"] }
 dialoguer = "0.11.0"
 facet = "0.43.2"
 facet-format = "0.43.2"
@@ -21,17 +7,35 @@ facet-json = "0.43.2"
 facet-toml = "0.43.2"
 handlebars = "6.3.1"
 semver = "1.0.25"
-serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.140"
 similar = "2.7.0"
 toml = "0.8.20"
+
+[dependencies.clap]
+features = ["derive"]
+version = "4.5.31"
+
+[dependencies.serde]
+features = ["derive"]
+version = "1.0.218"
 
 [dev-dependencies]
 assert_cmd = "2.0.16"
 predicates = "3.1.3"
 tempfile = "3.17.1"
 
-# The profile that 'dist' will build with
+[package]
+description = "better-releases cli tool"
+edition = "2024"
+exclude = ["brel.toml"]
+homepage = "https://better-releases.com"
+license = "MIT"
+name = "brel"
+readme = "README.md"
+repository = "https://github.com/better-releases/brel"
+version = "0.1.2"
+
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
