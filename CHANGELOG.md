@@ -1,3 +1,9 @@
+## [0.3.1] - 2026-02-18
+
+### 🐛 Bug Fixes
+
+- Update release & remove facet
+- Changelog prepend
 ## [0.3.0] - 2026-02-18
 
 ### 🚀 Features
