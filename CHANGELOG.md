@@ -1,3 +1,17 @@
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- Brel release resolution
+
+### 💼 Other
+
+- Git cliff & changelog
+- Changelog generation
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* V0.1.2
 ## [0.1.1] - 2026-02-17
 
 ### 💼 Other
