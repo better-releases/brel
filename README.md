@@ -80,7 +80,12 @@ When you run `brel release-pr`:
 
 ## How File Updates Work
 
-- `release_pr.version_updates` maps exact repo-relative file paths to dot-separated key paths.
+- `release_pr.version_updates` maps exact repo-relative file paths to selector paths.
+- Selector syntax:
+  - key: `version`
+  - nested key: `package.version`
+  - index selector: `packages[0].version`
+  - filter selector: `package[name=brel].version`
 - Supported file formats:
   - inferred from extension (`.json`, `.toml`)
   - or forced via `release_pr.format_overrides`
@@ -88,13 +93,28 @@ When you run `brel release-pr`:
   - a file is missing,
   - format cannot be determined,
   - parse fails,
-  - a key path does not exist,
-  - target value is not scalar.
+  - a selector is invalid,
+  - a selector matches no values,
+  - a selector uses index/filter on a non-array segment,
+  - a matched value is not a string.
+- Match behavior:
+  - all values matched by a selector are updated
+  - selectors do not create missing keys/paths
 
-Example key paths:
+Example selectors:
 
 - JSON: `"package.json" = ["version", "tooling.release.version"]`
+- JSON with filter: `"package.json" = ["package[name=brel].version"]`
 - TOML: `"Cargo.toml" = ["package.version"]`
+- Cargo.lock (explicit format override required):
+
+```toml
+[release_pr.version_updates]
+"Cargo.lock" = ["package[name=brel].version"]
+
+[release_pr.format_overrides]
+"Cargo.lock" = "toml"
+```
 
 ## Changelog Generation (`git-cliff`)
 

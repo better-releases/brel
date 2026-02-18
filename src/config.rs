@@ -1,4 +1,5 @@
 use crate::tag_template;
+use crate::version_selector;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -288,7 +289,7 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
 
         let mut normalized_keys = Vec::with_capacity(keys.len());
         for key in keys {
-            normalized_keys.push(normalize_dot_path(&key)?);
+            normalized_keys.push(normalize_version_selector(&key)?);
         }
 
         if version_updates
@@ -423,15 +424,15 @@ fn normalize_repo_relative_path(value: &str, label: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn normalize_dot_path(value: &str) -> Result<String> {
+fn normalize_version_selector(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        bail!("Version key path cannot be empty.");
+        bail!("Version selector cannot be empty.");
     }
 
-    if trimmed.split('.').any(|segment| segment.trim().is_empty()) {
-        bail!("Version key path `{trimmed}` is invalid. Use dot-separated non-empty segments.");
-    }
+    version_selector::parse_selector(trimmed).with_context(|| {
+        format!("Invalid version selector `{trimmed}` in `release_pr.version_updates`.")
+    })?;
 
     Ok(trimmed.to_string())
 }
@@ -721,6 +722,33 @@ email = "release@example.com"
     }
 
     #[test]
+    fn parses_release_pr_version_selectors() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.version_updates]
+"package.json" = ["packages[0].version", "package[name=brel].version"]
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(
+            config
+                .release_pr
+                .version_updates
+                .get("package.json")
+                .unwrap(),
+            &vec![
+                "packages[0].version".to_string(),
+                "package[name=brel].version".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn parses_release_pr_changelog_settings() {
         let temp_dir = tempdir().unwrap();
         let cwd = temp_dir.path();
@@ -779,7 +807,7 @@ tag_template = "release"
     }
 
     #[test]
-    fn rejects_empty_version_key_path() {
+    fn rejects_empty_version_selector() {
         let temp_dir = tempdir().unwrap();
         let cwd = temp_dir.path();
         fs::write(
@@ -792,7 +820,24 @@ tag_template = "release"
         .unwrap();
 
         let err = load(None, cwd).unwrap_err();
-        assert!(err.to_string().contains("Version key path"));
+        assert!(err.to_string().contains("Version selector cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_malformed_version_selector() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.version_updates]
+"package.json" = ["package[name].version"]
+"#,
+        )
+        .unwrap();
+
+        let err = load(None, cwd).unwrap_err();
+        assert!(err.to_string().contains("Invalid version selector"));
     }
 
     #[test]

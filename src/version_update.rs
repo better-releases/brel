@@ -1,14 +1,22 @@
 use crate::config::VersionFileFormat;
+use crate::version_selector::{SegmentQualifier, VersionSelector, parse_selector};
 use anyhow::{Context, Result, bail};
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
+use toml_edit::{DocumentMut, Item, Table, Value as TomlEditValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateReport {
     pub changed_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PathStep {
+    Key(String),
+    Index(usize),
 }
 
 pub fn apply_version_updates(
@@ -19,7 +27,7 @@ pub fn apply_version_updates(
 ) -> Result<UpdateReport> {
     let mut changed_files = Vec::new();
 
-    for (relative_path, keys) in version_updates {
+    for (relative_path, selectors) in version_updates {
         let file_path = repo_root.join(relative_path);
         if !file_path.exists() {
             bail!("Configured version update file `{relative_path}` was not found.");
@@ -30,9 +38,14 @@ pub fn apply_version_updates(
         let content = fs::read_to_string(&file_path)
             .with_context(|| format!("Failed to read `{}`.", file_path.display()))?;
 
+        let parsed_selectors = parse_selectors(selectors, &file_path)?;
         let changed = match format {
-            VersionFileFormat::Json => update_json_file(&file_path, &content, keys, next_version)?,
-            VersionFileFormat::Toml => update_toml_file(&file_path, &content, keys, next_version)?,
+            VersionFileFormat::Json => {
+                update_json_file(&file_path, &content, &parsed_selectors, next_version)?
+            }
+            VersionFileFormat::Toml => {
+                update_toml_file(&file_path, &content, &parsed_selectors, next_version)?
+            }
         };
 
         if changed {
@@ -41,6 +54,24 @@ pub fn apply_version_updates(
     }
 
     Ok(UpdateReport { changed_files })
+}
+
+fn parse_selectors(
+    selectors: &[String],
+    file_path: &Path,
+) -> Result<Vec<(String, VersionSelector)>> {
+    let mut parsed = Vec::with_capacity(selectors.len());
+    for raw_selector in selectors {
+        let selector_text = raw_selector.trim();
+        let selector = parse_selector(selector_text).with_context(|| {
+            format!(
+                "Invalid version selector `{selector_text}` while updating `{}`.",
+                file_path.display()
+            )
+        })?;
+        parsed.push((selector_text.to_string(), selector));
+    }
+    Ok(parsed)
 }
 
 fn detect_file_format(
@@ -69,21 +100,25 @@ fn detect_file_format(
 fn update_json_file(
     file_path: &Path,
     content: &str,
-    keys: &[String],
+    selectors: &[(String, VersionSelector)],
     next_version: &str,
 ) -> Result<bool> {
     let mut value: JsonValue = serde_json::from_str(content)
         .with_context(|| format!("Failed to parse JSON file `{}`.", file_path.display()))?;
 
     let mut changed = false;
-    for key_path in keys {
-        changed |= set_json_dot_path(&mut value, key_path, next_version).with_context(|| {
-            format!(
-                "While updating `{}` in `{}`.",
-                key_path,
-                file_path.display()
-            )
-        })?;
+    for (selector_text, selector) in selectors {
+        let target_paths = resolve_json_paths(&value, selector_text, selector, file_path)?;
+        for path in &target_paths {
+            changed |=
+                set_json_string_at_path(&mut value, path, next_version, selector_text, file_path)
+                    .with_context(|| {
+                    format!(
+                        "While updating selector `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+        }
     }
 
     if !changed {
@@ -98,95 +133,494 @@ fn update_json_file(
     Ok(true)
 }
 
-fn set_json_dot_path(root: &mut JsonValue, path: &str, next_version: &str) -> Result<bool> {
-    let mut segments = path.split('.').peekable();
-    let mut current = root;
+fn resolve_json_paths(
+    root: &JsonValue,
+    selector_text: &str,
+    selector: &VersionSelector,
+    file_path: &Path,
+) -> Result<Vec<Vec<PathStep>>> {
+    let mut current_paths = vec![Vec::new()];
 
-    while let Some(segment) = segments.next() {
-        let is_last = segments.peek().is_none();
-        let object = current
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("Expected `{segment}` parent to be a JSON object."))?;
+    for segment in &selector.segments {
+        let mut next_paths = BTreeSet::new();
 
-        let value = object
-            .get_mut(segment)
-            .ok_or_else(|| anyhow::anyhow!("Key `{segment}` does not exist."))?;
+        for current_path in &current_paths {
+            let Some(node) = json_value_at_path(root, current_path) else {
+                continue;
+            };
 
-        if is_last {
-            if value.is_array() || value.is_object() {
-                bail!("Target `{path}` must point to a scalar JSON value.");
+            let Some(child) = node.as_object().and_then(|object| object.get(&segment.key)) else {
+                continue;
+            };
+
+            let mut child_path = current_path.clone();
+            child_path.push(PathStep::Key(segment.key.clone()));
+
+            match &segment.qualifier {
+                None => {
+                    next_paths.insert(child_path);
+                }
+                Some(SegmentQualifier::Index(index)) => {
+                    let Some(array) = child.as_array() else {
+                        bail!(
+                            "Selector `{selector_text}` expects segment `{}` to be an array in `{}`.",
+                            segment.key,
+                            file_path.display()
+                        );
+                    };
+
+                    if array.get(*index).is_some() {
+                        let mut indexed_path = child_path;
+                        indexed_path.push(PathStep::Index(*index));
+                        next_paths.insert(indexed_path);
+                    }
+                }
+                Some(SegmentQualifier::Filter { field, value }) => {
+                    let Some(array) = child.as_array() else {
+                        bail!(
+                            "Selector `{selector_text}` expects segment `{}` to be an array in `{}`.",
+                            segment.key,
+                            file_path.display()
+                        );
+                    };
+
+                    for (idx, element) in array.iter().enumerate() {
+                        let Some(object) = element.as_object() else {
+                            bail!(
+                                "Selector `{selector_text}` expects all elements under `{}` to be JSON objects in `{}`.",
+                                segment.key,
+                                file_path.display()
+                            );
+                        };
+
+                        let Some(field_value) = object.get(field) else {
+                            continue;
+                        };
+
+                        let Some(actual_value) = field_value.as_str() else {
+                            bail!(
+                                "Selector `{selector_text}` expects filter field `{field}` to be a string in `{}`.",
+                                file_path.display()
+                            );
+                        };
+
+                        if actual_value == value {
+                            let mut indexed_path = child_path.clone();
+                            indexed_path.push(PathStep::Index(idx));
+                            next_paths.insert(indexed_path);
+                        }
+                    }
+                }
             }
-            let changed = !matches!(value, JsonValue::String(existing) if existing == next_version);
-            *value = JsonValue::String(next_version.to_string());
-            return Ok(changed);
         }
 
-        current = value;
+        current_paths = next_paths.into_iter().collect();
     }
 
-    bail!("Version key path cannot be empty.")
+    if current_paths.is_empty() {
+        bail!(
+            "Selector `{selector_text}` matched no values in `{}`.",
+            file_path.display()
+        );
+    }
+
+    Ok(current_paths)
+}
+
+fn json_value_at_path<'a>(root: &'a JsonValue, path: &[PathStep]) -> Option<&'a JsonValue> {
+    let mut current = root;
+    for step in path {
+        match step {
+            PathStep::Key(key) => {
+                current = current.as_object()?.get(key)?;
+            }
+            PathStep::Index(index) => {
+                current = current.as_array()?.get(*index)?;
+            }
+        }
+    }
+
+    Some(current)
+}
+
+fn set_json_string_at_path(
+    root: &mut JsonValue,
+    path: &[PathStep],
+    next_version: &str,
+    selector_text: &str,
+    file_path: &Path,
+) -> Result<bool> {
+    let mut current = root;
+    for step in path {
+        match step {
+            PathStep::Key(key) => {
+                let object = current.as_object_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+                current = object.get_mut(key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+            }
+            PathStep::Index(index) => {
+                let array = current.as_array_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+                current = array.get_mut(*index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+            }
+        }
+    }
+
+    let Some(existing_value) = current.as_str() else {
+        bail!(
+            "Selector `{selector_text}` matched a non-string JSON value in `{}`.",
+            file_path.display()
+        );
+    };
+
+    let changed = existing_value != next_version;
+    if changed {
+        *current = JsonValue::String(next_version.to_string());
+    }
+
+    Ok(changed)
 }
 
 fn update_toml_file(
     file_path: &Path,
     content: &str,
-    keys: &[String],
+    selectors: &[(String, VersionSelector)],
     next_version: &str,
 ) -> Result<bool> {
-    let mut value: TomlValue = content
+    let source_value: TomlValue = content
         .parse()
+        .with_context(|| format!("Failed to parse TOML file `{}`.", file_path.display()))?;
+    let mut document = content
+        .parse::<DocumentMut>()
         .with_context(|| format!("Failed to parse TOML file `{}`.", file_path.display()))?;
 
     let mut changed = false;
-    for key_path in keys {
-        changed |= set_toml_dot_path(&mut value, key_path, next_version).with_context(|| {
-            format!(
-                "While updating `{}` in `{}`.",
-                key_path,
-                file_path.display()
+    for (selector_text, selector) in selectors {
+        let target_paths = resolve_toml_paths(&source_value, selector_text, selector, file_path)?;
+        for path in &target_paths {
+            changed |= set_toml_string_at_path(
+                document.as_item_mut(),
+                path,
+                next_version,
+                selector_text,
+                file_path,
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "While updating selector `{selector_text}` in `{}`.",
+                    file_path.display()
+                )
+            })?;
+        }
     }
 
     if !changed {
         return Ok(false);
     }
 
-    let mut output = toml::to_string_pretty(&value)
-        .with_context(|| format!("Failed to serialize TOML file `{}`.", file_path.display()))?;
-    output.push('\n');
+    let mut output = document.to_string();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
     fs::write(file_path, output)
         .with_context(|| format!("Failed to write `{}`.", file_path.display()))?;
     Ok(true)
 }
 
-fn set_toml_dot_path(root: &mut TomlValue, path: &str, next_version: &str) -> Result<bool> {
-    let mut segments = path.split('.').peekable();
-    let mut current = root;
+fn resolve_toml_paths(
+    root: &TomlValue,
+    selector_text: &str,
+    selector: &VersionSelector,
+    file_path: &Path,
+) -> Result<Vec<Vec<PathStep>>> {
+    let mut current_paths = vec![Vec::new()];
 
-    while let Some(segment) = segments.next() {
-        let is_last = segments.peek().is_none();
-        let table = current
-            .as_table_mut()
-            .ok_or_else(|| anyhow::anyhow!("Expected `{segment}` parent to be a TOML table."))?;
+    for segment in &selector.segments {
+        let mut next_paths = BTreeSet::new();
 
-        let value = table
-            .get_mut(segment)
-            .ok_or_else(|| anyhow::anyhow!("Key `{segment}` does not exist."))?;
+        for current_path in &current_paths {
+            let Some(node) = toml_value_at_path(root, current_path) else {
+                continue;
+            };
 
-        if is_last {
-            if value.is_array() || value.is_table() {
-                bail!("Target `{path}` must point to a scalar TOML value.");
+            let Some(child) = node.as_table().and_then(|table| table.get(&segment.key)) else {
+                continue;
+            };
+
+            let mut child_path = current_path.clone();
+            child_path.push(PathStep::Key(segment.key.clone()));
+
+            match &segment.qualifier {
+                None => {
+                    next_paths.insert(child_path);
+                }
+                Some(SegmentQualifier::Index(index)) => {
+                    let Some(array) = child.as_array() else {
+                        bail!(
+                            "Selector `{selector_text}` expects segment `{}` to be an array in `{}`.",
+                            segment.key,
+                            file_path.display()
+                        );
+                    };
+
+                    if array.get(*index).is_some() {
+                        let mut indexed_path = child_path;
+                        indexed_path.push(PathStep::Index(*index));
+                        next_paths.insert(indexed_path);
+                    }
+                }
+                Some(SegmentQualifier::Filter { field, value }) => {
+                    let Some(array) = child.as_array() else {
+                        bail!(
+                            "Selector `{selector_text}` expects segment `{}` to be an array in `{}`.",
+                            segment.key,
+                            file_path.display()
+                        );
+                    };
+
+                    for (idx, element) in array.iter().enumerate() {
+                        let Some(table) = element.as_table() else {
+                            bail!(
+                                "Selector `{selector_text}` expects all elements under `{}` to be TOML tables in `{}`.",
+                                segment.key,
+                                file_path.display()
+                            );
+                        };
+
+                        let Some(field_value) = table.get(field) else {
+                            continue;
+                        };
+
+                        let Some(actual_value) = field_value.as_str() else {
+                            bail!(
+                                "Selector `{selector_text}` expects filter field `{field}` to be a string in `{}`.",
+                                file_path.display()
+                            );
+                        };
+
+                        if actual_value == value {
+                            let mut indexed_path = child_path.clone();
+                            indexed_path.push(PathStep::Index(idx));
+                            next_paths.insert(indexed_path);
+                        }
+                    }
+                }
             }
-            let changed = !matches!(value.as_str(), Some(existing) if existing == next_version);
-            *value = TomlValue::String(next_version.to_string());
-            return Ok(changed);
         }
 
-        current = value;
+        current_paths = next_paths.into_iter().collect();
     }
 
-    bail!("Version key path cannot be empty.")
+    if current_paths.is_empty() {
+        bail!(
+            "Selector `{selector_text}` matched no values in `{}`.",
+            file_path.display()
+        );
+    }
+
+    Ok(current_paths)
+}
+
+fn toml_value_at_path<'a>(root: &'a TomlValue, path: &[PathStep]) -> Option<&'a TomlValue> {
+    let mut current = root;
+    for step in path {
+        match step {
+            PathStep::Key(key) => {
+                current = current.as_table()?.get(key)?;
+            }
+            PathStep::Index(index) => {
+                current = current.as_array()?.get(*index)?;
+            }
+        }
+    }
+
+    Some(current)
+}
+
+fn set_toml_string_at_path(
+    root: &mut Item,
+    path: &[PathStep],
+    next_version: &str,
+    selector_text: &str,
+    file_path: &Path,
+) -> Result<bool> {
+    set_toml_string_in_item(root, path, next_version, selector_text, file_path)
+}
+
+fn set_toml_string_in_item(
+    item: &mut Item,
+    path: &[PathStep],
+    next_version: &str,
+    selector_text: &str,
+    file_path: &Path,
+) -> Result<bool> {
+    if path.is_empty() {
+        return match item {
+            Item::Value(value) => {
+                set_toml_string_in_value(value, &[], next_version, selector_text, file_path)
+            }
+            _ => bail!(
+                "Selector `{selector_text}` matched a non-string TOML value in `{}`.",
+                file_path.display()
+            ),
+        };
+    }
+
+    match &path[0] {
+        PathStep::Key(key) => match item {
+            Item::Table(table) => {
+                let child = table.get_mut(key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+                set_toml_string_in_item(child, &path[1..], next_version, selector_text, file_path)
+            }
+            Item::Value(TomlEditValue::InlineTable(table)) => {
+                let child = table.get_mut(key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+                set_toml_string_in_value(child, &path[1..], next_version, selector_text, file_path)
+            }
+            _ => bail!(
+                "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                file_path.display()
+            ),
+        },
+        PathStep::Index(index) => match item {
+            Item::ArrayOfTables(array) => {
+                let child = array.get_mut(*index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+                set_toml_string_in_table(child, &path[1..], next_version, selector_text, file_path)
+            }
+            Item::Value(TomlEditValue::Array(array)) => {
+                let child = array.get_mut(*index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                        file_path.display()
+                    )
+                })?;
+                set_toml_string_in_value(child, &path[1..], next_version, selector_text, file_path)
+            }
+            _ => bail!(
+                "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                file_path.display()
+            ),
+        },
+    }
+}
+
+fn set_toml_string_in_table(
+    table: &mut Table,
+    path: &[PathStep],
+    next_version: &str,
+    selector_text: &str,
+    file_path: &Path,
+) -> Result<bool> {
+    if path.is_empty() {
+        bail!(
+            "Selector `{selector_text}` matched a non-string TOML value in `{}`.",
+            file_path.display()
+        );
+    }
+
+    match &path[0] {
+        PathStep::Key(key) => {
+            let child = table.get_mut(key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                    file_path.display()
+                )
+            })?;
+            set_toml_string_in_item(child, &path[1..], next_version, selector_text, file_path)
+        }
+        PathStep::Index(_) => bail!(
+            "Internal selector path resolution error for `{selector_text}` in `{}`.",
+            file_path.display()
+        ),
+    }
+}
+
+fn set_toml_string_in_value(
+    value: &mut TomlEditValue,
+    path: &[PathStep],
+    next_version: &str,
+    selector_text: &str,
+    file_path: &Path,
+) -> Result<bool> {
+    if path.is_empty() {
+        let Some(existing_value) = value.as_str() else {
+            bail!(
+                "Selector `{selector_text}` matched a non-string TOML value in `{}`.",
+                file_path.display()
+            );
+        };
+
+        let changed = existing_value != next_version;
+        if changed {
+            *value = TomlEditValue::from(next_version);
+        }
+        return Ok(changed);
+    }
+
+    match &path[0] {
+        PathStep::Key(key) => {
+            let TomlEditValue::InlineTable(table) = value else {
+                bail!(
+                    "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                    file_path.display()
+                );
+            };
+            let child = table.get_mut(key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                    file_path.display()
+                )
+            })?;
+            set_toml_string_in_value(child, &path[1..], next_version, selector_text, file_path)
+        }
+        PathStep::Index(index) => {
+            let TomlEditValue::Array(array) = value else {
+                bail!(
+                    "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                    file_path.display()
+                );
+            };
+            let child = array.get_mut(*index).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal selector path resolution error for `{selector_text}` in `{}`.",
+                    file_path.display()
+                )
+            })?;
+            set_toml_string_in_value(child, &path[1..], next_version, selector_text, file_path)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +645,7 @@ mod tests {
             "package.json".to_string(),
             vec!["package.version".to_string()],
         );
+
         let report =
             apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
 
@@ -220,12 +655,62 @@ mod tests {
     }
 
     #[test]
-    fn updates_nested_toml_key() {
+    fn updates_json_indexed_value() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.json");
+        fs::write(
+            &file_path,
+            "{\n  \"packages\": [\n    {\"name\": \"a\", \"version\": \"1.0.0\"},\n    {\"name\": \"b\", \"version\": \"2.0.0\"}\n  ]\n}\n",
+        )
+        .unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.json".to_string(),
+            vec!["packages[1].version".to_string()],
+        );
+
+        let report =
+            apply_version_updates(temp_dir.path(), "9.9.9", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.json")]);
+        let content = fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("\"name\": \"a\",\n      \"version\": \"1.0.0\""));
+        assert!(content.contains("\"name\": \"b\",\n      \"version\": \"9.9.9\""));
+    }
+
+    #[test]
+    fn updates_all_json_filter_matches() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.json");
+        fs::write(
+            &file_path,
+            "{\n  \"package\": [\n    {\"name\": \"brel\", \"version\": \"1.0.0\"},\n    {\"name\": \"other\", \"version\": \"2.0.0\"},\n    {\"name\": \"brel\", \"version\": \"3.0.0\"}\n  ]\n}\n",
+        )
+        .unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.json".to_string(),
+            vec!["package[name=brel].version".to_string()],
+        );
+
+        let report =
+            apply_version_updates(temp_dir.path(), "7.7.7", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.json")]);
+        let content = fs::read_to_string(file_path).unwrap();
+        assert_eq!(content.matches("\"version\": \"7.7.7\"").count(), 2);
+        assert!(content.contains("\"version\": \"2.0.0\""));
+    }
+
+    #[test]
+    fn updates_nested_toml_key_without_reformatting() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("Cargo.toml");
         fs::write(
             &file_path,
-            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+            "[package]\n# Keep this comment\nname = \"demo\"\nversion = \"1.0.0\"\n",
         )
         .unwrap();
 
@@ -234,12 +719,112 @@ mod tests {
             "Cargo.toml".to_string(),
             vec!["package.version".to_string()],
         );
+
         let report =
             apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
 
         assert_eq!(report.changed_files, vec![PathBuf::from("Cargo.toml")]);
         let content = fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("# Keep this comment"));
         assert!(content.contains("version = \"1.1.0\""));
+    }
+
+    #[test]
+    fn updates_cargo_lock_style_selector() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("Cargo.lock");
+        fs::write(
+            &file_path,
+            "version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"brel\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "Cargo.lock".to_string(),
+            vec!["package[name=brel].version".to_string()],
+        );
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("Cargo.lock".to_string(), VersionFileFormat::Toml);
+
+        let report = apply_version_updates(temp_dir.path(), "0.3.0", &updates, &overrides).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("Cargo.lock")]);
+        let content = fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("name = \"dep\"\nversion = \"0.1.0\""));
+        assert!(content.contains("name = \"brel\"\nversion = \"0.3.0\""));
+    }
+
+    #[test]
+    fn fails_when_selector_matches_no_values() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.json");
+        fs::write(&file_path, "{ \"name\": \"demo\" }\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.json".to_string(), vec!["version".to_string()]);
+
+        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("matched no values"));
+    }
+
+    #[test]
+    fn fails_when_json_target_is_not_string() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.json");
+        fs::write(&file_path, "{ \"version\": {\"major\": 1} }\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.json".to_string(), vec!["version".to_string()]);
+
+        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
+            .unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("non-string JSON value"));
+    }
+
+    #[test]
+    fn fails_when_toml_target_is_not_string() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("Cargo.toml");
+        fs::write(&file_path, "[package]\nversion = 1\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "Cargo.toml".to_string(),
+            vec!["package.version".to_string()],
+        );
+
+        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
+            .unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("non-string TOML value"));
+    }
+
+    #[test]
+    fn fails_when_filter_is_applied_to_non_array() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.json");
+        fs::write(
+            &file_path,
+            "{\n  \"package\": {\"name\": \"brel\", \"version\": \"1.0.0\"}\n}\n",
+        )
+        .unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.json".to_string(),
+            vec!["package[name=brel].version".to_string()],
+        );
+
+        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expects segment `package` to be an array")
+        );
     }
 
     #[test]
@@ -251,35 +836,5 @@ mod tests {
         let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
             .unwrap_err();
         assert!(err.to_string().contains("was not found"));
-    }
-
-    #[test]
-    fn fails_when_key_missing() {
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("package.json");
-        fs::write(&file_path, "{ \"name\": \"demo\" }\n").unwrap();
-
-        let mut updates = BTreeMap::new();
-        updates.insert("package.json".to_string(), vec!["version".to_string()]);
-
-        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
-            .unwrap_err();
-        let err_text = format!("{err:#}");
-        assert!(err_text.contains("Key `version` does not exist"));
-    }
-
-    #[test]
-    fn fails_when_target_is_not_scalar() {
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("package.json");
-        fs::write(&file_path, "{ \"version\": {\"major\": 1} }\n").unwrap();
-
-        let mut updates = BTreeMap::new();
-        updates.insert("package.json".to_string(), vec!["version".to_string()]);
-
-        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
-            .unwrap_err();
-        let err_text = format!("{err:#}");
-        assert!(err_text.contains("must point to a scalar"));
     }
 }

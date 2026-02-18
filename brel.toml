@@ -1,5 +1,9 @@
+[release_pr.format_overrides]
+"Cargo.lock" = "toml"
+
 [release_pr.version_updates]
 "Cargo.toml" = ["package.version"]
+"Cargo.lock" = ["package[name=brel].version"]
 
 [release_pr.tagging]
 enabled = true

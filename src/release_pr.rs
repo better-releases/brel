@@ -993,6 +993,62 @@ tag_template = "{version}"
     }
 
     #[test]
+    fn release_pr_updates_cargo_lock_with_selector_and_format_override() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.version_updates]
+"Cargo.lock" = ["package[name=brel].version"]
+
+[release_pr.format_overrides]
+"Cargo.lock" = "toml"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("Cargo.lock"),
+            r#"
+version = 4
+
+[[package]]
+name = "dep"
+version = "0.9.0"
+
+[[package]]
+name = "brel"
+version = "1.2.3"
+"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok("[]"),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+
+        let lock_contents = fs::read_to_string(temp_dir.path().join("Cargo.lock")).unwrap();
+        assert!(lock_contents.contains("name = \"dep\"\nversion = \"0.9.0\""));
+        assert!(lock_contents.contains("name = \"brel\"\nversion = \"1.3.0\""));
+
+        let add_call = runner
+            .calls
+            .iter()
+            .find(|call| call.program == "git" && call.args.first() == Some(&"add".to_string()))
+            .expect("missing git add call");
+        assert!(add_call.args.contains(&"Cargo.lock".to_string()));
+    }
+
+    #[test]
     fn missing_gh_token_is_an_error() {
         let temp_dir = tempdir().unwrap();
         fs::write(
