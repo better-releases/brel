@@ -397,6 +397,8 @@ mod tests {
         assert!(content.contains("# managed-by: brel"));
         assert!(content.contains("- main"));
         assert!(content.contains("fetch-depth: 0"));
+        assert!(content.contains("uses: better-releases/setup-brel@v1"));
+        assert!(!content.contains("BREL_RELEASE_REPO"));
         assert!(content.contains("id: next-version"));
         assert!(content.contains("next_version=\"$(brel next-version)\""));
         assert!(content.contains("if: ${{ steps.next-version.outputs.version != '' }}"));

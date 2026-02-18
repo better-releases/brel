@@ -135,9 +135,8 @@ mod tests {
         ));
         assert!(!rendered.contains("--output CHANGELOG.md"));
         assert!(rendered.contains("uses: orhun/git-cliff-action@v4"));
-        assert!(rendered.contains("archive asset (.tar.gz, .tar.xz, .zip)"));
-        assert!(rendered.contains("tar -xaf"));
-        assert!(!rendered.contains("tar -xzf"));
+        assert!(rendered.contains("uses: better-releases/setup-brel@v1"));
+        assert!(!rendered.contains("BREL_RELEASE_REPO"));
         assert!(!rendered.contains("Create release tag"));
         assert!(!rendered.contains("pull_request:"));
     }

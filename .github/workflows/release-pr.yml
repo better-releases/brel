@@ -26,46 +26,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install brel (latest release)
-        env:
-          BREL_RELEASE_REPO: better-releases/brel
-        run: |
-          set -euo pipefail
-
-          release_json="$(curl -fsSL "https://api.github.com/repos/${BREL_RELEASE_REPO}/releases/latest")"
-          asset_name="$(echo "${release_json}" | jq -r '[.assets[] | select(.name | test("x86_64-unknown-linux-musl\\.(tar\\.(gz|xz)|zip)$"))][0].name // empty')"
-          asset_url="$(echo "${release_json}" | jq -r '[.assets[] | select(.name | test("x86_64-unknown-linux-musl\\.(tar\\.(gz|xz)|zip)$"))][0].browser_download_url // empty')"
-
-          if [ -z "${asset_name}" ] || [ -z "${asset_url}" ]; then
-            echo "Could not find a Linux x86_64 archive asset (.tar.gz, .tar.xz, .zip) for latest brel release." >&2
-            exit 1
-          fi
-
-          archive_path="${RUNNER_TEMP}/${asset_name}"
-          curl -fsSL "${asset_url}" -o "${archive_path}"
-
-          case "${asset_name}" in
-            *.tar.gz|*.tgz|*.tar.xz)
-              tar -xaf "${archive_path}" -C "${RUNNER_TEMP}"
-              ;;
-            *.zip)
-              unzip -q "${archive_path}" -d "${RUNNER_TEMP}"
-              ;;
-            *)
-              echo "Unsupported brel archive format: ${asset_name}" >&2
-              exit 1
-              ;;
-          esac
-
-          brel_bin="$(find "${RUNNER_TEMP}" -type f -name brel | head -n1)"
-          if [ -z "${brel_bin}" ]; then
-            echo "Unable to locate brel binary after extraction." >&2
-            exit 1
-          fi
-
-          chmod +x "${brel_bin}"
-          cp "${brel_bin}" "${RUNNER_TEMP}/brel"
-          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+      - name: Install brel
+        uses: better-releases/setup-brel@v1
 
       - name: Compute next version
         id: next-version
