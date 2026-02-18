@@ -1,3 +1,8 @@
+## [0.5.0] - 2026-02-18
+
+### 🚀 Features
+
+- Use setup-brel action
 ## [0.4.0] - 2026-02-18
 
 ### 🚀 Features
