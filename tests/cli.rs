@@ -71,6 +71,60 @@ fn next_version_prints_nothing_when_no_releasable_commits_exist() {
 }
 
 #[test]
+fn next_version_uses_configured_tag_template_for_baseline_detection() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.tagging]
+tag_template = "release-{version}"
+"#,
+    )
+    .unwrap();
+    run_git(temp_dir.path(), &["tag", "release-1.2.3"]);
+
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat: add feature"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("1.3.0\n"));
+}
+
+#[test]
+fn next_version_ignores_non_matching_legacy_tags() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.tagging]
+tag_template = "release-{version}"
+"#,
+    )
+    .unwrap();
+    run_git(temp_dir.path(), &["tag", "v1.2.3"]);
+
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat: add feature"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("0.1.0\n"));
+}
+
+#[test]
 fn init_without_config_creates_default_workflow() {
     let temp_dir = tempdir().unwrap();
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
@@ -146,6 +200,29 @@ enabled = true
     assert!(content.contains("pull_request:"));
     assert!(content.contains("- closed"));
     assert!(content.contains("Create release tag"));
+}
+
+#[test]
+fn init_with_custom_tag_template_updates_cliff_tag_arg() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.tagging]
+tag_template = "{version}"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes"])
+        .assert()
+        .success();
+
+    let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+    let content = fs::read_to_string(workflow).unwrap();
+    assert!(content.contains("args: --unreleased --tag ${{ steps.next-version.outputs.version }}"));
 }
 
 #[test]

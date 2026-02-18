@@ -1,3 +1,4 @@
+use crate::tag_template;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -113,6 +114,7 @@ pub struct ChangelogConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggingConfig {
     pub enabled: bool,
+    pub tag_template: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +145,7 @@ impl Default for ReleasePrConfig {
             },
             tagging: TaggingConfig {
                 enabled: DEFAULT_TAGGING_ENABLED,
+                tag_template: tag_template::DEFAULT_TAG_TEMPLATE.to_string(),
             },
         }
     }
@@ -192,6 +195,7 @@ struct RawChangelogConfig {
 #[derive(Debug, Default, facet::Facet)]
 struct RawTaggingConfig {
     enabled: Option<bool>,
+    tag_template: Option<String>,
 }
 
 pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> {
@@ -364,6 +368,13 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
     )?;
     let raw_tagging = raw_release_pr.tagging.unwrap_or_default();
     let tagging_enabled = raw_tagging.enabled.unwrap_or(DEFAULT_TAGGING_ENABLED);
+    let tag_template = tag_template::normalize_tag_template(
+        raw_tagging
+            .tag_template
+            .as_deref()
+            .unwrap_or(tag_template::DEFAULT_TAG_TEMPLATE),
+    )
+    .context("Invalid `release_pr.tagging.tag_template`.")?;
 
     Ok(ReleasePrConfig {
         version_updates,
@@ -380,6 +391,7 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         },
         tagging: TaggingConfig {
             enabled: tagging_enabled,
+            tag_template,
         },
     })
 }
@@ -522,7 +534,7 @@ fn collect_release_pr_nested_warnings(
     }
 
     if let Some(tagging) = release_pr.get("tagging").and_then(toml::Value::as_table) {
-        let allowed_tagging: BTreeSet<&str> = BTreeSet::from(["enabled"]);
+        let allowed_tagging: BTreeSet<&str> = BTreeSet::from(["enabled", "tag_template"]);
         for key in tagging
             .keys()
             .filter(|key| !allowed_tagging.contains(key.as_str()))
@@ -612,6 +624,10 @@ mod tests {
             DEFAULT_CHANGELOG_OUTPUT_FILE
         );
         assert!(!config.release_pr.tagging.enabled);
+        assert_eq!(
+            config.release_pr.tagging.tag_template,
+            tag_template::DEFAULT_TAG_TEMPLATE
+        );
         assert!(matches!(config.source, ConfigSource::Defaulted));
     }
 
@@ -698,6 +714,10 @@ email = "release@example.com"
             DEFAULT_CHANGELOG_OUTPUT_FILE
         );
         assert!(!config.release_pr.tagging.enabled);
+        assert_eq!(
+            config.release_pr.tagging.tag_template,
+            tag_template::DEFAULT_TAG_TEMPLATE
+        );
     }
 
     #[test]
@@ -728,12 +748,34 @@ output_file = "docs/changelog.md"
             r#"
 [release_pr.tagging]
 enabled = true
+tag_template = "{{version}}"
 "#,
         )
         .unwrap();
 
         let config = load(None, cwd).unwrap();
         assert!(config.release_pr.tagging.enabled);
+        assert_eq!(config.release_pr.tagging.tag_template, "{version}");
+    }
+
+    #[test]
+    fn rejects_invalid_release_pr_tag_template() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.tagging]
+tag_template = "release"
+"#,
+        )
+        .unwrap();
+
+        let err = load(None, cwd).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid `release_pr.tagging.tag_template`")
+        );
     }
 
     #[test]

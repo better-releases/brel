@@ -16,9 +16,12 @@ pub struct WorkflowRenderContext<'a> {
     pub github_token_expr: &'a str,
     pub next_version_non_empty_expr: &'a str,
     pub next_version_output_expr: &'a str,
+    pub next_version_tag_output_expr: &'a str,
     pub changelog_enabled: bool,
     pub changelog_output_file: &'a str,
     pub tagging_enabled: bool,
+    pub tagging_template_prefix_shell: &'a str,
+    pub tagging_template_suffix_shell: &'a str,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +33,7 @@ pub struct ReleasePrCommitContext<'a> {
 #[derive(Debug, Serialize)]
 pub struct ReleasePrBodyContext<'a> {
     pub version: &'a str,
+    pub tag: &'a str,
     pub base_branch: &'a str,
     pub release_branch: &'a str,
     pub commits: &'a [ReleasePrCommitContext<'a>],
@@ -40,7 +44,7 @@ pub const MANAGED_RELEASE_PR_MARKER: &str = "<!-- managed-by: brel -->";
 const GITHUB_RELEASE_PR_TEMPLATE: &str =
     include_str!("../templates/workflows/github/release-pr.yml.hbs");
 const DEFAULT_RELEASE_PR_BODY_TEMPLATE: &str = r#"<!-- managed-by: brel -->
-## Release v{{version}}
+## Release {{tag}}
 
 Base branch: `{{base_branch}}`
 Release branch: `{{release_branch}}`
@@ -107,9 +111,12 @@ mod tests {
                 github_token_expr: "${{ github.token }}",
                 next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
+                next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
                 changelog_enabled: true,
                 changelog_output_file: "CHANGELOG.md",
                 tagging_enabled: false,
+                tagging_template_prefix_shell: "'v'",
+                tagging_template_suffix_shell: "''",
             },
         )
         .unwrap();
@@ -144,9 +151,12 @@ mod tests {
                 github_token_expr: "${{ github.token }}",
                 next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
+                next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
                 changelog_enabled: false,
                 changelog_output_file: "CHANGELOG.md",
                 tagging_enabled: false,
+                tagging_template_prefix_shell: "'v'",
+                tagging_template_suffix_shell: "''",
             },
         )
         .unwrap();
@@ -166,9 +176,12 @@ mod tests {
                 github_token_expr: "${{ github.token }}",
                 next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
+                next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
                 changelog_enabled: true,
                 changelog_output_file: "CHANGELOG.md",
                 tagging_enabled: true,
+                tagging_template_prefix_shell: "'v'",
+                tagging_template_suffix_shell: "''",
             },
         )
         .unwrap();
@@ -180,6 +193,35 @@ mod tests {
     }
 
     #[test]
+    fn renders_custom_tag_template_expressions() {
+        let rendered = render_workflow(
+            Provider::Github,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                next_version_command: "brel next-version",
+                github_token_expr: "${{ github.token }}",
+                next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
+                next_version_output_expr: "${{ steps.next-version.outputs.version }}",
+                next_version_tag_output_expr: "release-${{ steps.next-version.outputs.version }}",
+                changelog_enabled: true,
+                changelog_output_file: "CHANGELOG.md",
+                tagging_enabled: true,
+                tagging_template_prefix_shell: "release-",
+                tagging_template_suffix_shell: "''",
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains(
+            "args: --unreleased --tag release-${{ steps.next-version.outputs.version }} --output CHANGELOG.md"
+        ));
+        assert!(rendered.contains("prefix=release-"));
+        assert!(rendered.contains("suffix=''"));
+    }
+
+    #[test]
     fn renders_default_release_pr_body_template() {
         let commits = [ReleasePrCommitContext {
             sha_short: "abc1234",
@@ -188,6 +230,7 @@ mod tests {
         let rendered = render_release_pr_body(
             &ReleasePrBodyContext {
                 version: "1.2.3",
+                tag: "v1.2.3",
                 base_branch: "main",
                 release_branch: "brel/release/v1.2.3",
                 commits: &commits,

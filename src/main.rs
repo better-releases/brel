@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod init;
 mod release_pr;
+mod tag_template;
 mod template;
 mod version_update;
 mod workflow;

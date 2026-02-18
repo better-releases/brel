@@ -67,11 +67,19 @@ jobs:
           cp "${brel_bin}" "${RUNNER_TEMP}/brel"
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
+      - name: Compute next version
+        id: next-version
+        run: |
+          set -euo pipefail
+          next_version="$(brel next-version)"
+          echo "version=${next_version}" >> "${GITHUB_OUTPUT}"
+
       - name: Generate changelog
+        if: ${{ steps.next-version.outputs.version != '' }}
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --output CHANGELOG.md
+          args: --unreleased --tag v${{ steps.next-version.outputs.version }} --output CHANGELOG.md
 
       - name: Generate release PR
         env:
@@ -100,9 +108,43 @@ jobs:
             exit 0
           fi
 
-          version="$(printf '%s' "${pr_title}" | sed -nE 's/^Release v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
-          if [ -z "${version}" ]; then
+          tag="$(printf '%s' "${pr_title}" | sed -nE 's/^Release (.+)$/\1/p')"
+          if [ -z "${tag}" ]; then
             echo "PR title does not match expected release format. Skipping tag creation."
+            exit 0
+          fi
+
+          prefix=v
+          suffix=''
+
+          if [ -n "${prefix}" ] && [[ "${tag}" != "${prefix}"* ]]; then
+            echo "PR title tag does not match configured tag template. Skipping tag creation."
+            exit 0
+          fi
+
+          candidate="${tag:${#prefix}}"
+          if [ -n "${suffix}" ]; then
+            if [[ "${candidate}" != *"${suffix}" ]]; then
+              echo "PR title tag does not match configured tag template. Skipping tag creation."
+              exit 0
+            fi
+            if [ "${#candidate}" -lt "${#suffix}" ]; then
+              echo "PR title tag does not match configured tag template. Skipping tag creation."
+              exit 0
+            fi
+            version="${candidate:0:${#candidate}-${#suffix}}"
+          else
+            version="${candidate}"
+          fi
+
+          if ! printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "PR title tag does not contain a stable semver. Skipping tag creation."
+            exit 0
+          fi
+
+          expected_tag="${prefix}${version}${suffix}"
+          if [ "${expected_tag}" != "${tag}" ]; then
+            echo "PR title tag does not match configured tag template. Skipping tag creation."
             exit 0
           fi
 
@@ -111,7 +153,6 @@ jobs:
             exit 0
           fi
 
-          tag="v${version}"
           git fetch --tags origin
           if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
             echo "Tag ${tag} already exists. Skipping."

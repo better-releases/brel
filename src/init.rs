@@ -1,5 +1,6 @@
 use crate::cli::InitArgs;
 use crate::config::{self, ConfigSource, Provider};
+use crate::tag_template::{self, TagTemplate};
 use crate::template::{self, WorkflowRenderContext, WorkflowTemplate};
 use crate::workflow;
 use anyhow::{Context, Result, bail};
@@ -111,6 +112,12 @@ pub(crate) fn run_with_interactor(
     let workflow_absolute_path = repo_root.join(&workflow_path);
     let release_pr_command = build_release_pr_command(options.config_path.as_deref());
     let next_version_command = build_next_version_command(options.config_path.as_deref());
+    let next_version_output_expr = "${{ steps.next-version.outputs.version }}";
+    let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
+        .context("Invalid normalized release tag template.")?;
+    let next_version_tag_output_expr = tag_template.render(next_version_output_expr);
+    let tagging_template_prefix_shell = tag_template::shell_escape_single(tag_template.prefix());
+    let tagging_template_suffix_shell = tag_template::shell_escape_single(tag_template.suffix());
     let rendered = template::render_workflow(
         config.provider,
         WorkflowTemplate::ReleasePr,
@@ -120,10 +127,13 @@ pub(crate) fn run_with_interactor(
             next_version_command: &next_version_command,
             github_token_expr: "${{ github.token }}",
             next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
-            next_version_output_expr: "${{ steps.next-version.outputs.version }}",
+            next_version_output_expr,
+            next_version_tag_output_expr: &next_version_tag_output_expr,
             changelog_enabled: config.release_pr.changelog.enabled,
             changelog_output_file: &config.release_pr.changelog.output_file,
             tagging_enabled: config.release_pr.tagging.enabled,
+            tagging_template_prefix_shell: &tagging_template_prefix_shell,
+            tagging_template_suffix_shell: &tagging_template_suffix_shell,
         },
     )?;
 
@@ -282,7 +292,7 @@ fn build_release_pr_command(explicit_config_path: Option<&Path>) -> String {
 
     format!(
         "brel release-pr --config {}",
-        shell_escape_single(path.to_string_lossy().as_ref())
+        tag_template::shell_escape_single(path.to_string_lossy().as_ref())
     )
 }
 
@@ -301,20 +311,8 @@ fn build_next_version_command(explicit_config_path: Option<&Path>) -> String {
 
     format!(
         "brel next-version --config {}",
-        shell_escape_single(path.to_string_lossy().as_ref())
+        tag_template::shell_escape_single(path.to_string_lossy().as_ref())
     )
-}
-
-fn shell_escape_single(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
-    {
-        return value.to_string();
-    }
-
-    let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
 }
 
 fn print_diff(before: &str, after: &str) {
@@ -436,6 +434,31 @@ enabled = true
         assert!(content.contains("pull_request:"));
         assert!(content.contains("Create release tag"));
         assert!(content.contains("if: github.event_name == 'pull_request'"));
+    }
+
+    #[test]
+    fn tagging_template_updates_workflow_tag_generation() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+enabled = true
+tag_template = "release-{version}-prod"
+"#,
+        )
+        .unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+        let content = fs::read_to_string(workflow).unwrap();
+        assert!(content.contains(
+            "args: --unreleased --tag release-${{ steps.next-version.outputs.version }}-prod"
+        ));
+        assert!(content.contains("prefix=release-"));
+        assert!(content.contains("suffix=-prod"));
     }
 
     #[test]

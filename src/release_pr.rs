@@ -1,5 +1,6 @@
 use crate::cli::{NextVersionArgs, ReleasePrArgs};
 use crate::config::{self, Provider, ReleasePrConfig, ResolvedConfig};
+use crate::tag_template::TagTemplate;
 use crate::template::{
     self, MANAGED_RELEASE_PR_MARKER, ReleasePrBodyContext, ReleasePrCommitContext,
 };
@@ -30,8 +31,10 @@ pub(crate) fn run_with_runner(
     gh_token_override: Option<&str>,
 ) -> Result<()> {
     let config = load_supported_config(config_path, repo_root, "release-pr")?;
+    let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
+        .context("Invalid normalized release tag template.")?;
 
-    let Some(next_release) = resolve_next_release(runner, repo_root)? else {
+    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template)? else {
         println!("No releasable commits found. Skipping release PR.");
         return Ok(());
     };
@@ -42,6 +45,7 @@ pub(crate) fn run_with_runner(
     }
 
     let next_version_string = next_release.next_version.to_string();
+    let next_tag = tag_template.render(&next_version_string);
 
     let update_report = version_update::apply_version_updates(
         repo_root,
@@ -50,7 +54,7 @@ pub(crate) fn run_with_runner(
         &config.release_pr.format_overrides,
     )?;
     if update_report.changed_files.is_empty() {
-        println!("Version targets already set to v{next_version_string}. Nothing to commit.");
+        println!("Version targets already set to {next_tag}. Nothing to commit.");
         return Ok(());
     }
 
@@ -76,7 +80,7 @@ pub(crate) fn run_with_runner(
         return Ok(());
     }
 
-    let commit_message = format!("chore(release): v{next_version_string}");
+    let commit_message = format!("chore(release): {next_tag}");
     git_commit(runner, repo_root, &config.release_pr, &commit_message)?;
     git_push_branch(runner, repo_root, &release_branch)?;
 
@@ -89,10 +93,11 @@ pub(crate) fn run_with_runner(
             subject: commit.subject.trim(),
         })
         .collect::<Vec<_>>();
-    let pr_title = format!("Release v{next_version_string}");
+    let pr_title = format!("Release {next_tag}");
     let pr_body = template::render_release_pr_body(
         &ReleasePrBodyContext {
             version: &next_version_string,
+            tag: &next_tag,
             base_branch: &config.default_branch,
             release_branch: &release_branch,
             commits: &commit_contexts,
@@ -121,7 +126,7 @@ pub(crate) fn run_with_runner(
         )?,
     }
 
-    println!("Release PR prepared for version v{next_version_string}.");
+    println!("Release PR prepared for tag {next_tag}.");
     Ok(())
 }
 
@@ -130,8 +135,10 @@ pub(crate) fn run_next_version_with_runner(
     config_path: Option<&Path>,
     runner: &mut dyn CommandRunner,
 ) -> Result<()> {
-    let _config = load_supported_config(config_path, repo_root, "next-version")?;
-    let Some(next_release) = resolve_next_release(runner, repo_root)? else {
+    let config = load_supported_config(config_path, repo_root, "next-version")?;
+    let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
+        .context("Invalid normalized release tag template.")?;
+    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template)? else {
         return Ok(());
     };
 
@@ -224,8 +231,9 @@ struct NextRelease {
 fn resolve_next_release(
     runner: &mut dyn CommandRunner,
     repo_root: &Path,
+    tag_template: &TagTemplate,
 ) -> Result<Option<NextRelease>> {
-    let latest_tag = find_latest_release_tag(runner, repo_root)?;
+    let latest_tag = find_latest_release_tag(runner, repo_root, tag_template)?;
     let commits = collect_commits_since(
         runner,
         repo_root,
@@ -249,6 +257,7 @@ fn resolve_next_release(
 fn find_latest_release_tag(
     runner: &mut dyn CommandRunner,
     repo_root: &Path,
+    tag_template: &TagTemplate,
 ) -> Result<Option<TaggedVersion>> {
     let output = run_checked(
         runner,
@@ -266,7 +275,7 @@ fn find_latest_release_tag(
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let Some(parsed_version) = parse_release_tag(raw_tag) else {
+        let Some(parsed_version) = parse_release_tag(raw_tag, tag_template) else {
             continue;
         };
 
@@ -287,13 +296,8 @@ fn find_latest_release_tag(
     Ok(latest)
 }
 
-fn parse_release_tag(tag: &str) -> Option<Version> {
-    let normalized = tag.trim().strip_prefix('v').unwrap_or(tag.trim());
-    let version = Version::parse(normalized).ok()?;
-    if !version.pre.is_empty() || !version.build.is_empty() {
-        return None;
-    }
-    Some(version)
+fn parse_release_tag(tag: &str, tag_template: &TagTemplate) -> Option<Version> {
+    tag_template.parse_stable_version(tag)
 }
 
 #[derive(Debug, Clone)]
@@ -798,16 +802,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_release_tag_supports_v_prefix_and_plain_tags() {
+    fn parse_release_tag_supports_only_configured_template() {
+        let template = TagTemplate::parse("release-{version}").unwrap();
         assert_eq!(
-            parse_release_tag("v1.2.3"),
+            parse_release_tag("release-1.2.3", &template),
             Some(Version::parse("1.2.3").unwrap())
         );
-        assert_eq!(
-            parse_release_tag("1.2.3"),
-            Some(Version::parse("1.2.3").unwrap())
-        );
-        assert!(parse_release_tag("v1.2.3-rc.1").is_none());
+        assert!(parse_release_tag("v1.2.3", &template).is_none());
+        assert!(parse_release_tag("1.2.3", &template).is_none());
+        assert!(parse_release_tag("release-1.2.3-rc.1", &template).is_none());
     }
 
     #[test]
@@ -840,8 +843,9 @@ mod tests {
             ok("v1.2.3\n"),
             ok(&log_entry("abc123456789", "feat: add feature", "")),
         ]);
+        let template = TagTemplate::parse("v{version}").unwrap();
 
-        let release = resolve_next_release(&mut runner, temp_dir.path())
+        let release = resolve_next_release(&mut runner, temp_dir.path(), &template)
             .unwrap()
             .expect("expected releasable version");
 
@@ -857,8 +861,9 @@ mod tests {
             ok("v1.2.3\n"),
             ok(&log_entry("abc123456789", "chore: update docs", "")),
         ]);
+        let template = TagTemplate::parse("v{version}").unwrap();
 
-        let release = resolve_next_release(&mut runner, temp_dir.path()).unwrap();
+        let release = resolve_next_release(&mut runner, temp_dir.path(), &template).unwrap();
         assert!(release.is_none());
     }
 
@@ -937,6 +942,53 @@ default_branch = "main"
                 && call
                     .args
                     .starts_with(&["pr".to_string(), "edit".to_string(), "7".to_string()])
+        }));
+    }
+
+    #[test]
+    fn tag_template_updates_commit_and_pr_title() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+tag_template = "{version}"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok("[]"),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && call.args.first() == Some(&"-c".to_string())
+                && call.args.contains(&"chore(release): 1.3.0".to_string())
+        }));
+
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "gh"
+                && call.args.contains(&"--title".to_string())
+                && call.args.contains(&"Release 1.3.0".to_string())
         }));
     }
 

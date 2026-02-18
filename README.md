@@ -53,6 +53,7 @@ output_file = "CHANGELOG.md"
 
 [release_pr.tagging]
 enabled = false
+tag_template = "v{version}"
 
 [release_pr.commit_author]
 name = "brel[bot]"
@@ -63,7 +64,7 @@ email = "brel[bot]@users.noreply.github.com"
 
 When you run `brel release-pr`:
 
-1. It finds the highest stable SemVer tag (`vX.Y.Z` or `X.Y.Z`).
+1. It finds the highest stable SemVer tag that matches `release_pr.tagging.tag_template` (default `v{version}`).
 2. If no valid tag exists, it uses `0.0.0`.
 3. It scans commits since that tag (or all commits when no tag exists).
 4. It picks one bump level from Conventional Commit signals:
@@ -104,7 +105,7 @@ Example key paths:
 - Generated workflow behavior:
   - computes `next-version` first via `brel next-version`
   - runs `git-cliff` only when a next version exists
-  - passes `--unreleased --tag v<next-version>` so the newest changelog section is versioned instead of `[unreleased]`
+  - passes `--unreleased --tag <rendered-tag-template>` so the newest changelog section is versioned instead of `[unreleased]`
 - If changelog generation is enabled, `brel release-pr` stages `output_file` in the release commit when that file exists.
 - Disable changelog generation:
 
@@ -119,7 +120,11 @@ enabled = false
 
 - Default branch pattern: `brel/release/v{{version}}`
   - Only `{{version}}` is supported as a token.
-- Commit message: `chore(release): vX.Y.Z`
+- `release_pr.tagging.tag_template` controls rendered release tags (default `v{version}`).
+  - `tag_template` accepts `{version}` and legacy `{{version}}` (normalized to `{version}`).
+  - `tag_template` must include exactly one version token.
+- Commit message: `chore(release): <rendered-tag>`
+- PR title: `Release <rendered-tag>`
 - Commit author defaults to:
   - `name = "brel[bot]"`
   - `email = "brel[bot]@users.noreply.github.com"`
@@ -134,8 +139,9 @@ For PRs:
 ## Tagging on Merge
 
 - Optional config: `[release_pr.tagging] enabled = true` (default `false`).
+- Tag format config: `[release_pr.tagging] tag_template = "v{version}"` (default shown).
 - When enabled, the generated workflow listens for merged pull requests into the configured default branch.
-- If the merged PR is managed by `brel` and titled `Release vX.Y.Z`, the workflow creates and pushes the tag `vX.Y.Z` when it does not already exist.
+- If the merged PR is managed by `brel` and titled `Release <rendered-tag>`, the workflow validates it against `tag_template`, then creates and pushes that tag when it does not already exist.
 
 ## PR Body Templates
 
@@ -144,6 +150,7 @@ If `release_pr.pr_template_file` is set, `brel` renders that Handlebars template
 Available variables:
 
 - `version`
+- `tag`
 - `base_branch`
 - `release_branch`
 - `commits` (array of `{ sha_short, subject }`)
