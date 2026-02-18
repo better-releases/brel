@@ -149,6 +149,8 @@ fn init_without_config_creates_default_workflow() {
     assert!(
         content.contains("args: --unreleased --tag v${{ steps.next-version.outputs.version }}")
     );
+    assert!(content.contains("--prepend CHANGELOG.md"));
+    assert!(!content.contains("--output CHANGELOG.md"));
     assert!(content.contains("uses: orhun/git-cliff-action@v4"));
     assert!(content.contains("run: brel release-pr"));
     assert!(!content.contains("pull_request:"));
@@ -223,6 +225,8 @@ tag_template = "{version}"
     let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
     let content = fs::read_to_string(workflow).unwrap();
     assert!(content.contains("args: --unreleased --tag ${{ steps.next-version.outputs.version }}"));
+    assert!(content.contains("--prepend CHANGELOG.md"));
+    assert!(!content.contains("--output CHANGELOG.md"));
 }
 
 #[test]

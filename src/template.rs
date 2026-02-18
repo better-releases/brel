@@ -129,8 +129,9 @@ mod tests {
         assert!(rendered.contains("GH_TOKEN: ${{ github.token }}"));
         assert!(rendered.contains("if: ${{ steps.next-version.outputs.version != '' }}"));
         assert!(rendered.contains(
-            "args: --unreleased --tag v${{ steps.next-version.outputs.version }} --output CHANGELOG.md"
+            "args: --unreleased --tag v${{ steps.next-version.outputs.version }} --prepend CHANGELOG.md"
         ));
+        assert!(!rendered.contains("--output CHANGELOG.md"));
         assert!(rendered.contains("uses: orhun/git-cliff-action@v4"));
         assert!(rendered.contains("archive asset (.tar.gz, .tar.xz, .zip)"));
         assert!(rendered.contains("tar -xaf"));
@@ -215,8 +216,9 @@ mod tests {
         .unwrap();
 
         assert!(rendered.contains(
-            "args: --unreleased --tag release-${{ steps.next-version.outputs.version }} --output CHANGELOG.md"
+            "args: --unreleased --tag release-${{ steps.next-version.outputs.version }} --prepend CHANGELOG.md"
         ));
+        assert!(!rendered.contains("--output CHANGELOG.md"));
         assert!(rendered.contains("prefix=release-"));
         assert!(rendered.contains("suffix=''"));
     }

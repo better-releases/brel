@@ -82,7 +82,7 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --unreleased --tag {{next_version_tag_output_expr}} --output {{changelog_output_file}}
+          args: --unreleased --tag {{next_version_tag_output_expr}} --prepend {{changelog_output_file}}
 
 {{/if}}
       - name: Generate release PR

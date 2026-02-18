@@ -390,6 +390,8 @@ mod tests {
         assert!(
             content.contains("args: --unreleased --tag v${{ steps.next-version.outputs.version }}")
         );
+        assert!(content.contains("--prepend CHANGELOG.md"));
+        assert!(!content.contains("--output CHANGELOG.md"));
         assert!(content.contains("uses: orhun/git-cliff-action@v4"));
         assert!(!content.contains("pull_request:"));
     }
@@ -457,6 +459,8 @@ tag_template = "release-{version}-prod"
         assert!(content.contains(
             "args: --unreleased --tag release-${{ steps.next-version.outputs.version }}-prod"
         ));
+        assert!(content.contains("--prepend CHANGELOG.md"));
+        assert!(!content.contains("--output CHANGELOG.md"));
         assert!(content.contains("prefix=release-"));
         assert!(content.contains("suffix=-prod"));
     }
