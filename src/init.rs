@@ -110,13 +110,17 @@ pub(crate) fn run_with_interactor(
     let workflow_path = workflow::resolve_workflow_path(&config.workflow_file)?;
     let workflow_absolute_path = repo_root.join(&workflow_path);
     let release_pr_command = build_release_pr_command(options.config_path.as_deref());
+    let next_version_command = build_next_version_command(options.config_path.as_deref());
     let rendered = template::render_workflow(
         config.provider,
         WorkflowTemplate::ReleasePr,
         &WorkflowRenderContext {
             default_branch: &selected_branch,
             release_pr_command: &release_pr_command,
+            next_version_command: &next_version_command,
             github_token_expr: "${{ github.token }}",
+            next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
+            next_version_output_expr: "${{ steps.next-version.outputs.version }}",
             changelog_enabled: config.release_pr.changelog.enabled,
             changelog_output_file: &config.release_pr.changelog.output_file,
             tagging_enabled: config.release_pr.tagging.enabled,
@@ -282,6 +286,25 @@ fn build_release_pr_command(explicit_config_path: Option<&Path>) -> String {
     )
 }
 
+fn build_next_version_command(explicit_config_path: Option<&Path>) -> String {
+    let Some(path) = explicit_config_path else {
+        return "brel next-version".to_string();
+    };
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if file_name == "brel.toml" || file_name == ".brel.toml" {
+        return "brel next-version".to_string();
+    }
+
+    format!(
+        "brel next-version --config {}",
+        shell_escape_single(path.to_string_lossy().as_ref())
+    )
+}
+
 fn shell_escape_single(value: &str) -> String {
     if value
         .chars()
@@ -363,6 +386,12 @@ mod tests {
         assert!(content.contains("# managed-by: brel"));
         assert!(content.contains("- main"));
         assert!(content.contains("fetch-depth: 0"));
+        assert!(content.contains("id: next-version"));
+        assert!(content.contains("next_version=\"$(brel next-version)\""));
+        assert!(content.contains("if: ${{ steps.next-version.outputs.version != '' }}"));
+        assert!(
+            content.contains("args: --unreleased --tag v${{ steps.next-version.outputs.version }}")
+        );
         assert!(content.contains("uses: orhun/git-cliff-action@v4"));
         assert!(!content.contains("pull_request:"));
     }

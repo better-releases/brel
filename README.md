@@ -6,6 +6,7 @@
 
 - `brel init` generates a managed GitHub Actions workflow.
 - `brel release-pr` computes the next version, updates configured files, commits, pushes, and creates/updates a release PR.
+- `brel next-version` computes the next releasable version and prints it as plain SemVer.
 
 ## `release-pr` Prerequisites
 
@@ -71,6 +72,11 @@ When you run `brel release-pr`:
    - patch: `fix: ...`
 5. If no releasable commits are found, it exits successfully with no changes.
 
+`brel next-version` uses the same versioning rules:
+
+- when releasable commits exist, it prints the next version (for example `1.2.3`)
+- when none exist, it prints nothing and exits successfully
+
 ## How File Updates Work
 
 - `release_pr.version_updates` maps exact repo-relative file paths to dot-separated key paths.
@@ -95,6 +101,10 @@ Example key paths:
 - Configure changelog behavior with `[release_pr.changelog]`:
   - `enabled` (default `true`)
   - `output_file` (default `"CHANGELOG.md"`)
+- Generated workflow behavior:
+  - computes `next-version` first via `brel next-version`
+  - runs `git-cliff` only when a next version exists
+  - passes `--unreleased --tag v<next-version>` so the newest changelog section is versioned instead of `[unreleased]`
 - If changelog generation is enabled, `brel release-pr` stages `output_file` in the release commit when that file exists.
 - Disable changelog generation:
 
@@ -164,4 +174,10 @@ Run with explicit config:
 
 ```bash
 brel release-pr --config ./configs/release.toml
+```
+
+Preview the next release version:
+
+```bash
+brel next-version
 ```

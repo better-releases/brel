@@ -69,12 +69,20 @@ jobs:
           cp "${brel_bin}" "${RUNNER_TEMP}/brel"
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
+      - name: Compute next version
+        id: next-version
+        run: |
+          set -euo pipefail
+          next_version="$({{next_version_command}})"
+          echo "version=${next_version}" >> "${GITHUB_OUTPUT}"
+
 {{#if changelog_enabled}}
       - name: Generate changelog
+        if: {{next_version_non_empty_expr}}
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --output {{changelog_output_file}}
+          args: --unreleased --tag v{{next_version_output_expr}} --output {{changelog_output_file}}
 
 {{/if}}
       - name: Generate release PR

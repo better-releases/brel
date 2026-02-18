@@ -37,6 +37,40 @@ fn release_pr_no_releasable_commits_exits_successfully() {
 }
 
 #[test]
+fn next_version_prints_semver_when_releasable_commits_exist() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat: add feature"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("0.1.0\n"));
+}
+
+#[test]
+fn next_version_prints_nothing_when_no_releasable_commits_exist() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join("notes.txt"), "docs").unwrap();
+    run_git(temp_dir.path(), &["add", "notes.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "chore: add notes"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq(""));
+}
+
+#[test]
 fn init_without_config_creates_default_workflow() {
     let temp_dir = tempdir().unwrap();
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
@@ -54,7 +88,13 @@ fn init_without_config_creates_default_workflow() {
     assert!(content.contains("# managed-by: brel"));
     assert!(content.contains("workflow_dispatch"));
     assert!(content.contains("fetch-depth: 0"));
+    assert!(content.contains("id: next-version"));
+    assert!(content.contains("next_version=\"$(brel next-version)\""));
     assert!(content.contains("GH_TOKEN: ${{ github.token }}"));
+    assert!(content.contains("if: ${{ steps.next-version.outputs.version != '' }}"));
+    assert!(
+        content.contains("args: --unreleased --tag v${{ steps.next-version.outputs.version }}")
+    );
     assert!(content.contains("uses: orhun/git-cliff-action@v4"));
     assert!(content.contains("run: brel release-pr"));
     assert!(!content.contains("pull_request:"));

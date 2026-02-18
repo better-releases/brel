@@ -1,4 +1,4 @@
-use crate::cli::ReleasePrArgs;
+use crate::cli::{NextVersionArgs, ReleasePrArgs};
 use crate::config::{self, Provider, ReleasePrConfig, ResolvedConfig};
 use crate::template::{
     self, MANAGED_RELEASE_PR_MARKER, ReleasePrBodyContext, ReleasePrCommitContext,
@@ -17,31 +17,21 @@ pub fn run(args: ReleasePrArgs) -> Result<()> {
     run_with_runner(&repo_root, args.config.as_deref(), &mut runner, None)
 }
 
+pub fn run_next_version(args: NextVersionArgs) -> Result<()> {
+    let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
+    let mut runner = ProcessRunner;
+    run_next_version_with_runner(&repo_root, args.config.as_deref(), &mut runner)
+}
+
 pub(crate) fn run_with_runner(
     repo_root: &Path,
     config_path: Option<&Path>,
     runner: &mut dyn CommandRunner,
     gh_token_override: Option<&str>,
 ) -> Result<()> {
-    let config = config::load(config_path, repo_root)?;
-    for warning in &config.warnings {
-        eprintln!("warning: {warning}");
-    }
+    let config = load_supported_config(config_path, repo_root, "release-pr")?;
 
-    if config.provider != Provider::Github {
-        bail!(
-            "Provider `{}` is configured, but `brel release-pr` currently supports only `github`.",
-            config.provider
-        );
-    }
-
-    let latest_tag = find_latest_release_tag(runner, repo_root)?;
-    let commits = collect_commits_since(
-        runner,
-        repo_root,
-        latest_tag.as_ref().map(|tag| tag.raw.as_str()),
-    )?;
-    let Some(next_bump) = highest_bump(commits.iter()) else {
+    let Some(next_release) = resolve_next_release(runner, repo_root)? else {
         println!("No releasable commits found. Skipping release PR.");
         return Ok(());
     };
@@ -51,12 +41,7 @@ pub(crate) fn run_with_runner(
         return Ok(());
     }
 
-    let base_version = latest_tag
-        .as_ref()
-        .map(|tag| tag.version.clone())
-        .unwrap_or_else(|| Version::new(0, 0, 0));
-    let next_version = bump_version(&base_version, next_bump);
-    let next_version_string = next_version.to_string();
+    let next_version_string = next_release.next_version.to_string();
 
     let update_report = version_update::apply_version_updates(
         repo_root,
@@ -96,7 +81,8 @@ pub(crate) fn run_with_runner(
     git_push_branch(runner, repo_root, &release_branch)?;
 
     let template_override = load_template_override(repo_root, &config.release_pr)?;
-    let commit_contexts = commits
+    let commit_contexts = next_release
+        .commits
         .iter()
         .map(|commit| ReleasePrCommitContext {
             sha_short: short_sha(&commit.sha),
@@ -137,6 +123,40 @@ pub(crate) fn run_with_runner(
 
     println!("Release PR prepared for version v{next_version_string}.");
     Ok(())
+}
+
+pub(crate) fn run_next_version_with_runner(
+    repo_root: &Path,
+    config_path: Option<&Path>,
+    runner: &mut dyn CommandRunner,
+) -> Result<()> {
+    let _config = load_supported_config(config_path, repo_root, "next-version")?;
+    let Some(next_release) = resolve_next_release(runner, repo_root)? else {
+        return Ok(());
+    };
+
+    println!("{}", next_release.next_version);
+    Ok(())
+}
+
+fn load_supported_config(
+    config_path: Option<&Path>,
+    repo_root: &Path,
+    command_name: &str,
+) -> Result<ResolvedConfig> {
+    let config = config::load(config_path, repo_root)?;
+    for warning in &config.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    if config.provider != Provider::Github {
+        bail!(
+            "Provider `{}` is configured, but `brel {command_name}` currently supports only `github`.",
+            config.provider
+        );
+    }
+
+    Ok(config)
 }
 
 fn load_template_override(
@@ -193,6 +213,37 @@ fn short_sha(sha: &str) -> &str {
 struct TaggedVersion {
     raw: String,
     version: Version,
+}
+
+#[derive(Debug, Clone)]
+struct NextRelease {
+    next_version: Version,
+    commits: Vec<CommitInfo>,
+}
+
+fn resolve_next_release(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+) -> Result<Option<NextRelease>> {
+    let latest_tag = find_latest_release_tag(runner, repo_root)?;
+    let commits = collect_commits_since(
+        runner,
+        repo_root,
+        latest_tag.as_ref().map(|tag| tag.raw.as_str()),
+    )?;
+    let Some(next_bump) = highest_bump(commits.iter()) else {
+        return Ok(None);
+    };
+
+    let base_version = latest_tag
+        .as_ref()
+        .map(|tag| tag.version.clone())
+        .unwrap_or_else(|| Version::new(0, 0, 0));
+
+    Ok(Some(NextRelease {
+        next_version: bump_version(&base_version, next_bump),
+        commits,
+    }))
 }
 
 fn find_latest_release_tag(
@@ -780,6 +831,35 @@ mod tests {
         assert_eq!(classify_commit(&patch), Some(BumpLevel::Patch));
         assert_eq!(classify_commit(&minor), Some(BumpLevel::Minor));
         assert_eq!(classify_commit(&major), Some(BumpLevel::Major));
+    }
+
+    #[test]
+    fn resolve_next_release_returns_bumped_version_and_commits() {
+        let temp_dir = tempdir().unwrap();
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+        ]);
+
+        let release = resolve_next_release(&mut runner, temp_dir.path())
+            .unwrap()
+            .expect("expected releasable version");
+
+        assert_eq!(release.next_version, Version::new(1, 3, 0));
+        assert_eq!(release.commits.len(), 1);
+        assert_eq!(release.commits[0].subject, "feat: add feature");
+    }
+
+    #[test]
+    fn resolve_next_release_returns_none_when_no_releasable_commits() {
+        let temp_dir = tempdir().unwrap();
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "chore: update docs", "")),
+        ]);
+
+        let release = resolve_next_release(&mut runner, temp_dir.path()).unwrap();
+        assert!(release.is_none());
     }
 
     #[test]

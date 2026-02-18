@@ -14,6 +14,8 @@ pub enum Commands {
     Init(InitArgs),
     /// Create or update a release PR.
     ReleasePr(ReleasePrArgs),
+    /// Compute the next releasable version.
+    NextVersion(NextVersionArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -31,6 +33,13 @@ pub struct InitArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct ReleasePrArgs {
+    /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct NextVersionArgs {
     /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
     #[arg(long)]
     pub config: Option<PathBuf>,

@@ -22,5 +22,6 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Init(args) => init::run(args),
         Commands::ReleasePr(args) => release_pr::run(args),
+        Commands::NextVersion(args) => release_pr::run_next_version(args),
     }
 }

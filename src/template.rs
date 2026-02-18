@@ -12,7 +12,10 @@ pub enum WorkflowTemplate {
 pub struct WorkflowRenderContext<'a> {
     pub default_branch: &'a str,
     pub release_pr_command: &'a str,
+    pub next_version_command: &'a str,
     pub github_token_expr: &'a str,
+    pub next_version_non_empty_expr: &'a str,
+    pub next_version_output_expr: &'a str,
     pub changelog_enabled: bool,
     pub changelog_output_file: &'a str,
     pub tagging_enabled: bool,
@@ -100,7 +103,10 @@ mod tests {
             &WorkflowRenderContext {
                 default_branch: "main",
                 release_pr_command: "brel release-pr --config custom.toml",
+                next_version_command: "brel next-version --config custom.toml",
                 github_token_expr: "${{ github.token }}",
+                next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
+                next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 changelog_enabled: true,
                 changelog_output_file: "CHANGELOG.md",
                 tagging_enabled: false,
@@ -111,7 +117,13 @@ mod tests {
         assert!(rendered.contains("# managed-by: brel"));
         assert!(rendered.contains("- main"));
         assert!(rendered.contains("run: brel release-pr --config custom.toml"));
+        assert!(rendered.contains("id: next-version"));
+        assert!(rendered.contains("next_version=\"$(brel next-version --config custom.toml)\""));
         assert!(rendered.contains("GH_TOKEN: ${{ github.token }}"));
+        assert!(rendered.contains("if: ${{ steps.next-version.outputs.version != '' }}"));
+        assert!(rendered.contains(
+            "args: --unreleased --tag v${{ steps.next-version.outputs.version }} --output CHANGELOG.md"
+        ));
         assert!(rendered.contains("uses: orhun/git-cliff-action@v4"));
         assert!(rendered.contains("archive asset (.tar.gz, .tar.xz, .zip)"));
         assert!(rendered.contains("tar -xaf"));
@@ -128,7 +140,10 @@ mod tests {
             &WorkflowRenderContext {
                 default_branch: "main",
                 release_pr_command: "brel release-pr",
+                next_version_command: "brel next-version",
                 github_token_expr: "${{ github.token }}",
+                next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
+                next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 changelog_enabled: false,
                 changelog_output_file: "CHANGELOG.md",
                 tagging_enabled: false,
@@ -147,7 +162,10 @@ mod tests {
             &WorkflowRenderContext {
                 default_branch: "main",
                 release_pr_command: "brel release-pr",
+                next_version_command: "brel next-version",
                 github_token_expr: "${{ github.token }}",
+                next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
+                next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 changelog_enabled: true,
                 changelog_output_file: "CHANGELOG.md",
                 tagging_enabled: true,
