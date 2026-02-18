@@ -195,13 +195,51 @@ enabled = true
     cmd.current_dir(temp_dir.path())
         .args(["init", "--yes"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(
+            "Tagging is enabled. Add repository secret `BREL_TAG_PUSH_TOKEN`",
+        ));
 
     let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
     let content = fs::read_to_string(workflow).unwrap();
     assert!(content.contains("pull_request:"));
     assert!(content.contains("- closed"));
     assert!(content.contains("Create release tag"));
+}
+
+#[test]
+fn init_with_enabled_tagging_dry_run_prints_pat_notice() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.tagging]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run: would create"))
+        .stdout(predicate::str::contains(
+            "Tagging is enabled. Add repository secret `BREL_TAG_PUSH_TOKEN`",
+        ));
+}
+
+#[test]
+fn init_with_disabled_tagging_does_not_print_pat_notice() {
+    let temp_dir = tempdir().unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BREL_TAG_PUSH_TOKEN").not());
 }
 
 #[test]

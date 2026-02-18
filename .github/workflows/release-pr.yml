@@ -90,10 +90,23 @@ jobs:
     if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
+      - name: Validate tag push token
+        env:
+          BREL_TAG_PUSH_TOKEN: ${{ secrets.BREL_TAG_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BREL_TAG_PUSH_TOKEN}" ]; then
+            echo "Missing repository secret BREL_TAG_PUSH_TOKEN." >&2
+            echo "Use a PAT with Contents: Read and write to push release tags from this workflow." >&2
+            echo "GITHUB_TOKEN tag pushes do not trigger downstream tag-push workflows." >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}
 
       - name: Create release tag
         run: |

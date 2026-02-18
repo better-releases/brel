@@ -14,6 +14,7 @@ pub struct WorkflowRenderContext<'a> {
     pub release_pr_command: &'a str,
     pub next_version_command: &'a str,
     pub github_token_expr: &'a str,
+    pub tagging_push_token_expr: &'a str,
     pub next_version_non_empty_expr: &'a str,
     pub next_version_output_expr: &'a str,
     pub next_version_tag_output_expr: &'a str,
@@ -109,6 +110,7 @@ mod tests {
                 release_pr_command: "brel release-pr --config custom.toml",
                 next_version_command: "brel next-version --config custom.toml",
                 github_token_expr: "${{ github.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
@@ -150,6 +152,7 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 next_version_command: "brel next-version",
                 github_token_expr: "${{ github.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
@@ -175,6 +178,7 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 next_version_command: "brel next-version",
                 github_token_expr: "${{ github.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
@@ -191,6 +195,13 @@ mod tests {
         assert!(rendered.contains("if: github.event_name == 'pull_request'"));
         assert!(rendered.contains("types:"));
         assert!(rendered.contains("- closed"));
+        assert!(rendered.contains("Validate tag push token"));
+        assert!(rendered.contains("BREL_TAG_PUSH_TOKEN"));
+        assert!(rendered.contains("token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
+        assert!(
+            rendered
+                .contains("GITHUB_TOKEN tag pushes do not trigger downstream tag-push workflows.")
+        );
     }
 
     #[test]
@@ -203,6 +214,7 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 next_version_command: "brel next-version",
                 github_token_expr: "${{ github.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "release-${{ steps.next-version.outputs.version }}",

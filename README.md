@@ -162,6 +162,10 @@ For PRs:
 - Tag format config: `[release_pr.tagging] tag_template = "v{version}"` (default shown).
 - When enabled, the generated workflow listens for merged pull requests into the configured default branch.
 - If the merged PR is managed by `brel` and titled `Release <rendered-tag>`, the workflow validates it against `tag_template`, then creates and pushes that tag when it does not already exist.
+- Create repository secret `BREL_TAG_PUSH_TOKEN` before using tagging-on-merge.
+  - Use a PAT that can push tags to the repository (fine-grained PAT with `Contents: Read and write`).
+  - This is required because pushes done with `GITHUB_TOKEN` do not trigger downstream tag-push workflows.
+- `brel init` prints this secret requirement whenever tagging is enabled.
 
 ## PR Body Templates
 

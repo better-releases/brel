@@ -126,6 +126,7 @@ pub(crate) fn run_with_interactor(
             release_pr_command: &release_pr_command,
             next_version_command: &next_version_command,
             github_token_expr: "${{ github.token }}",
+            tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
             next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
             next_version_output_expr,
             next_version_tag_output_expr: &next_version_tag_output_expr,
@@ -157,42 +158,43 @@ pub(crate) fn run_with_interactor(
     match action {
         FileAction::Skip(reason) => {
             println!("Skipped `{}` ({reason}).", workflow_path.display());
-            Ok(())
         }
         FileAction::Create => {
             if options.dry_run {
                 println!("Dry run: would create `{}`", workflow_path.display());
                 print_diff("", &rendered);
-                return Ok(());
+            } else {
+                if let Some(parent) = workflow_absolute_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "Failed to create workflow directory `{}`.",
+                            parent.display()
+                        )
+                    })?;
+                }
+                fs::write(&workflow_absolute_path, rendered)
+                    .with_context(|| format!("Failed to write `{}`.", workflow_path.display()))?;
+                println!("Created `{}`", workflow_path.display());
             }
-
-            if let Some(parent) = workflow_absolute_path.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "Failed to create workflow directory `{}`.",
-                        parent.display()
-                    )
-                })?;
-            }
-            fs::write(&workflow_absolute_path, rendered)
-                .with_context(|| format!("Failed to write `{}`.", workflow_path.display()))?;
-            println!("Created `{}`", workflow_path.display());
-            Ok(())
         }
         FileAction::Overwrite => {
             let before = existing.as_deref().unwrap_or_default();
             if options.dry_run {
                 println!("Dry run: would overwrite `{}`", workflow_path.display());
                 print_diff(before, &rendered);
-                return Ok(());
+            } else {
+                fs::write(&workflow_absolute_path, rendered)
+                    .with_context(|| format!("Failed to write `{}`.", workflow_path.display()))?;
+                println!("Updated `{}`", workflow_path.display());
             }
-
-            fs::write(&workflow_absolute_path, rendered)
-                .with_context(|| format!("Failed to write `{}`.", workflow_path.display()))?;
-            println!("Updated `{}`", workflow_path.display());
-            Ok(())
         }
+    };
+
+    if config.release_pr.tagging.enabled {
+        print_tagging_token_notice();
     }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +277,17 @@ fn print_defaults_summary() {
     println!("  provider: github");
     println!("  default_branch: main");
     println!("  workflow_file: release-pr.yml");
+}
+
+fn print_tagging_token_notice() {
+    println!(
+        "Tagging is enabled. Add repository secret `BREL_TAG_PUSH_TOKEN` \
+         (PAT with Contents: Read and write)."
+    );
+    println!(
+        "Without this token, tags pushed by the workflow will not trigger \
+         downstream tag-push workflows."
+    );
 }
 
 fn build_release_pr_command(explicit_config_path: Option<&Path>) -> String {
@@ -436,6 +449,9 @@ enabled = true
         assert!(content.contains("pull_request:"));
         assert!(content.contains("Create release tag"));
         assert!(content.contains("if: github.event_name == 'pull_request'"));
+        assert!(content.contains("Validate tag push token"));
+        assert!(content.contains("BREL_TAG_PUSH_TOKEN"));
+        assert!(content.contains("token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
     }
 
     #[test]
