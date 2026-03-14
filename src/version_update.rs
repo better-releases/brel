@@ -1,7 +1,6 @@
 use crate::config::VersionFileFormat;
 use crate::version_selector::{SegmentQualifier, VersionSelector, parse_selector};
 use anyhow::{Context, Result, bail};
-use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +16,341 @@ pub struct UpdateReport {
 enum PathStep {
     Key(String),
     Index(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceSpan {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JsonNode {
+    Object(JsonObject),
+    Array(JsonArray),
+    String(JsonString),
+    Number(SourceSpan),
+    Bool(SourceSpan),
+    Null(SourceSpan),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonObject {
+    entries: Vec<JsonObjectEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonObjectEntry {
+    key: String,
+    value: JsonNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonArray {
+    elements: Vec<JsonNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonString {
+    span: SourceSpan,
+    value: String,
+}
+
+impl JsonNode {
+    fn as_object(&self) -> Option<&JsonObject> {
+        match self {
+            Self::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&JsonArray> {
+        match self {
+            Self::Array(array) => Some(array),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(&value.value),
+            _ => None,
+        }
+    }
+
+    fn string_span(&self) -> Option<SourceSpan> {
+        match self {
+            Self::String(value) => Some(value.span),
+            _ => None,
+        }
+    }
+}
+
+impl JsonObject {
+    fn get(&self, key: &str) -> Option<&JsonNode> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.key == key)
+            .map(|entry| &entry.value)
+    }
+}
+
+struct JsonParser<'a> {
+    input: &'a str,
+    position: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
+    }
+
+    fn parse_document(mut self) -> Result<JsonNode> {
+        self.skip_whitespace();
+        let value = self.parse_value()?;
+        self.skip_whitespace();
+
+        if self.position != self.input.len() {
+            bail!("Unexpected trailing content at byte {}.", self.position);
+        }
+
+        Ok(value)
+    }
+
+    fn parse_value(&mut self) -> Result<JsonNode> {
+        self.skip_whitespace();
+
+        match self.peek_byte() {
+            Some(b'{') => self.parse_object(),
+            Some(b'[') => self.parse_array(),
+            Some(b'"') => self.parse_string().map(JsonNode::String),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            Some(b't') => self.parse_keyword("true", JsonNode::Bool),
+            Some(b'f') => self.parse_keyword("false", JsonNode::Bool),
+            Some(b'n') => self.parse_keyword("null", JsonNode::Null),
+            Some(_) => bail!("Unexpected character at byte {}.", self.position),
+            None => bail!("Unexpected end of JSON input."),
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<JsonNode> {
+        self.expect_byte(b'{', "`{`")?;
+        self.skip_whitespace();
+
+        let mut entries = Vec::new();
+        if self.consume_byte_if(b'}') {
+            return Ok(JsonNode::Object(JsonObject { entries }));
+        }
+
+        loop {
+            self.skip_whitespace();
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect_byte(b':', "`:`")?;
+            let value = self.parse_value()?;
+            entries.push(JsonObjectEntry {
+                key: key.value,
+                value,
+            });
+
+            self.skip_whitespace();
+            if self.consume_byte_if(b',') {
+                continue;
+            }
+
+            self.expect_byte(b'}', "`}`")?;
+            return Ok(JsonNode::Object(JsonObject { entries }));
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<JsonNode> {
+        self.expect_byte(b'[', "`[`")?;
+        self.skip_whitespace();
+
+        let mut elements = Vec::new();
+        if self.consume_byte_if(b']') {
+            return Ok(JsonNode::Array(JsonArray { elements }));
+        }
+
+        loop {
+            let value = self.parse_value()?;
+            elements.push(value);
+
+            self.skip_whitespace();
+            if self.consume_byte_if(b',') {
+                continue;
+            }
+
+            self.expect_byte(b']', "`]`")?;
+            return Ok(JsonNode::Array(JsonArray { elements }));
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<JsonString> {
+        let start = self.position;
+        self.expect_byte(b'"', "string opening quote")?;
+
+        while let Some(byte) = self.peek_byte() {
+            match byte {
+                b'"' => {
+                    self.position += 1;
+                    let raw = &self.input[start..self.position];
+                    let value = serde_json::from_str(raw)
+                        .with_context(|| format!("Invalid JSON string literal at byte {start}."))?;
+
+                    return Ok(JsonString {
+                        span: SourceSpan {
+                            start,
+                            end: self.position,
+                        },
+                        value,
+                    });
+                }
+                b'\\' => self.parse_escape_sequence()?,
+                0x00..=0x1f => {
+                    bail!(
+                        "Invalid control character in JSON string at byte {}.",
+                        self.position
+                    )
+                }
+                _ => {
+                    self.position += 1;
+                }
+            }
+        }
+
+        bail!("Unterminated JSON string starting at byte {start}.")
+    }
+
+    fn parse_escape_sequence(&mut self) -> Result<()> {
+        self.expect_byte(b'\\', "escape sequence")?;
+        let Some(escaped) = self.peek_byte() else {
+            bail!("Unterminated JSON escape sequence at end of input.");
+        };
+
+        match escaped {
+            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                self.position += 1;
+            }
+            b'u' => {
+                self.position += 1;
+                for _ in 0..4 {
+                    let Some(hex) = self.peek_byte() else {
+                        bail!("Incomplete unicode escape sequence at end of input.");
+                    };
+                    if !hex.is_ascii_hexdigit() {
+                        bail!("Invalid unicode escape sequence at byte {}.", self.position);
+                    }
+                    self.position += 1;
+                }
+            }
+            _ => bail!("Invalid escape sequence at byte {}.", self.position),
+        }
+
+        Ok(())
+    }
+
+    fn parse_number(&mut self) -> Result<JsonNode> {
+        let start = self.position;
+
+        if self.consume_byte_if(b'-') && !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+            bail!("Invalid number at byte {start}.");
+        }
+
+        match self.peek_byte() {
+            Some(b'0') => {
+                self.position += 1;
+            }
+            Some(b'1'..=b'9') => {
+                self.position += 1;
+                while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                    self.position += 1;
+                }
+            }
+            _ => bail!("Invalid number at byte {start}."),
+        }
+
+        if self.consume_byte_if(b'.') {
+            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                bail!("Invalid number at byte {start}.");
+            }
+
+            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                self.position += 1;
+            }
+        }
+
+        if matches!(self.peek_byte(), Some(b'e' | b'E')) {
+            self.position += 1;
+            if matches!(self.peek_byte(), Some(b'+' | b'-')) {
+                self.position += 1;
+            }
+
+            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                bail!("Invalid number at byte {start}.");
+            }
+
+            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                self.position += 1;
+            }
+        }
+
+        Ok(JsonNode::Number(SourceSpan {
+            start,
+            end: self.position,
+        }))
+    }
+
+    fn parse_keyword<F>(&mut self, keyword: &str, constructor: F) -> Result<JsonNode>
+    where
+        F: FnOnce(SourceSpan) -> JsonNode,
+    {
+        let start = self.position;
+        if !self
+            .input
+            .get(self.position..)
+            .is_some_and(|tail| tail.starts_with(keyword))
+        {
+            bail!("Unexpected token at byte {start}.");
+        }
+
+        self.position += keyword.len();
+        Ok(constructor(SourceSpan {
+            start,
+            end: self.position,
+        }))
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek_byte(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.position += 1;
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8, label: &str) -> Result<()> {
+        match self.peek_byte() {
+            Some(byte) if byte == expected => {
+                self.position += 1;
+                Ok(())
+            }
+            Some(_) => bail!("Expected {label} at byte {}.", self.position),
+            None => bail!("Expected {label} at end of input."),
+        }
+    }
+
+    fn consume_byte_if(&mut self, expected: u8) -> bool {
+        if self.peek_byte() == Some(expected) {
+            self.position += 1;
+            return true;
+        }
+
+        false
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.position).copied()
+    }
 }
 
 pub fn apply_version_updates(
@@ -103,38 +437,52 @@ fn update_json_file(
     selectors: &[(String, VersionSelector)],
     next_version: &str,
 ) -> Result<bool> {
-    let mut value: JsonValue = serde_json::from_str(content)
+    let value = JsonParser::new(content)
+        .parse_document()
         .with_context(|| format!("Failed to parse JSON file `{}`.", file_path.display()))?;
+    let replacement_literal = serde_json::to_string(next_version).with_context(|| {
+        format!(
+            "Failed to serialize JSON value for `{}`.",
+            file_path.display()
+        )
+    })?;
+    let mut replacements: BTreeMap<usize, (SourceSpan, String)> = BTreeMap::new();
 
-    let mut changed = false;
     for (selector_text, selector) in selectors {
         let target_paths = resolve_json_paths(&value, selector_text, selector, file_path)?;
         for path in &target_paths {
-            changed |=
-                set_json_string_at_path(&mut value, path, next_version, selector_text, file_path)
+            if let Some(span) =
+                json_string_span_at_path(&value, path, next_version, selector_text, file_path)
                     .with_context(|| {
-                    format!(
-                        "While updating selector `{selector_text}` in `{}`.",
-                        file_path.display()
-                    )
-                })?;
+                        format!(
+                            "While updating selector `{selector_text}` in `{}`.",
+                            file_path.display()
+                        )
+                    })?
+            {
+                replacements
+                    .entry(span.start)
+                    .or_insert_with(|| (span, replacement_literal.clone()));
+            }
         }
     }
 
-    if !changed {
+    if replacements.is_empty() {
         return Ok(false);
     }
 
-    let mut output = serde_json::to_string_pretty(&value)
-        .with_context(|| format!("Failed to serialize JSON file `{}`.", file_path.display()))?;
-    output.push('\n');
+    let mut output = content.to_string();
+    for (_, (span, replacement)) in replacements.iter().rev() {
+        output.replace_range(span.start..span.end, replacement);
+    }
+
     fs::write(file_path, output)
         .with_context(|| format!("Failed to write `{}`.", file_path.display()))?;
     Ok(true)
 }
 
 fn resolve_json_paths(
-    root: &JsonValue,
+    root: &JsonNode,
     selector_text: &str,
     selector: &VersionSelector,
     file_path: &Path,
@@ -169,7 +517,7 @@ fn resolve_json_paths(
                         );
                     };
 
-                    if array.get(*index).is_some() {
+                    if array.elements.get(*index).is_some() {
                         let mut indexed_path = child_path;
                         indexed_path.push(PathStep::Index(*index));
                         next_paths.insert(indexed_path);
@@ -184,7 +532,7 @@ fn resolve_json_paths(
                         );
                     };
 
-                    for (idx, element) in array.iter().enumerate() {
+                    for (idx, element) in array.elements.iter().enumerate() {
                         let Some(object) = element.as_object() else {
                             bail!(
                                 "Selector `{selector_text}` expects all elements under `{}` to be JSON objects in `{}`.",
@@ -227,7 +575,7 @@ fn resolve_json_paths(
     Ok(current_paths)
 }
 
-fn json_value_at_path<'a>(root: &'a JsonValue, path: &[PathStep]) -> Option<&'a JsonValue> {
+fn json_value_at_path<'a>(root: &'a JsonNode, path: &[PathStep]) -> Option<&'a JsonNode> {
     let mut current = root;
     for step in path {
         match step {
@@ -235,7 +583,7 @@ fn json_value_at_path<'a>(root: &'a JsonValue, path: &[PathStep]) -> Option<&'a 
                 current = current.as_object()?.get(key)?;
             }
             PathStep::Index(index) => {
-                current = current.as_array()?.get(*index)?;
+                current = current.as_array()?.elements.get(*index)?;
             }
         }
     }
@@ -243,46 +591,19 @@ fn json_value_at_path<'a>(root: &'a JsonValue, path: &[PathStep]) -> Option<&'a 
     Some(current)
 }
 
-fn set_json_string_at_path(
-    root: &mut JsonValue,
+fn json_string_span_at_path(
+    root: &JsonNode,
     path: &[PathStep],
     next_version: &str,
     selector_text: &str,
     file_path: &Path,
-) -> Result<bool> {
-    let mut current = root;
-    for step in path {
-        match step {
-            PathStep::Key(key) => {
-                let object = current.as_object_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
-                        file_path.display()
-                    )
-                })?;
-                current = object.get_mut(key).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
-                        file_path.display()
-                    )
-                })?;
-            }
-            PathStep::Index(index) => {
-                let array = current.as_array_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
-                        file_path.display()
-                    )
-                })?;
-                current = array.get_mut(*index).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Internal selector path resolution error for `{selector_text}` in `{}`.",
-                        file_path.display()
-                    )
-                })?;
-            }
-        }
-    }
+) -> Result<Option<SourceSpan>> {
+    let current = json_value_at_path(root, path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Internal selector path resolution error for `{selector_text}` in `{}`.",
+            file_path.display()
+        )
+    })?;
 
     let Some(existing_value) = current.as_str() else {
         bail!(
@@ -291,12 +612,16 @@ fn set_json_string_at_path(
         );
     };
 
-    let changed = existing_value != next_version;
-    if changed {
-        *current = JsonValue::String(next_version.to_string());
+    if existing_value == next_version {
+        return Ok(None);
     }
 
-    Ok(changed)
+    Ok(Some(current.string_span().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Internal selector path resolution error for `{selector_text}` in `{}`.",
+            file_path.display()
+        )
+    })?))
 }
 
 fn update_toml_file(
@@ -631,14 +956,29 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn updates_nested_json_key() {
+    fn updates_package_json_version_without_reordering_fields() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("package.json");
-        fs::write(
-            &file_path,
-            "{\n  \"package\": {\"version\": \"1.0.0\"},\n  \"name\": \"demo\"\n}\n",
-        )
-        .unwrap();
+        let original = "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"build\": \"vite build\"\n  }\n}\n";
+        fs::write(&file_path, original).unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.json".to_string(), vec!["version".to_string()]);
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.json")]);
+        let expected = "{\n  \"name\": \"demo\",\n  \"version\": \"1.1.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"build\": \"vite build\"\n  }\n}\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn updates_nested_json_key_without_reformatting() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.json");
+        let original = "{\n  \"package\": {\"version\": \"1.0.0\"},\n  \"name\": \"demo\"\n}\n";
+        fs::write(&file_path, original).unwrap();
 
         let mut updates = BTreeMap::new();
         updates.insert(
@@ -650,19 +990,16 @@ mod tests {
             apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
 
         assert_eq!(report.changed_files, vec![PathBuf::from("package.json")]);
-        let content = fs::read_to_string(file_path).unwrap();
-        assert!(content.contains("\"version\": \"1.1.0\""));
+        let expected = "{\n  \"package\": {\"version\": \"1.1.0\"},\n  \"name\": \"demo\"\n}\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
     }
 
     #[test]
-    fn updates_json_indexed_value() {
+    fn updates_json_indexed_value_without_reformatting() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("package.json");
-        fs::write(
-            &file_path,
-            "{\n  \"packages\": [\n    {\"name\": \"a\", \"version\": \"1.0.0\"},\n    {\"name\": \"b\", \"version\": \"2.0.0\"}\n  ]\n}\n",
-        )
-        .unwrap();
+        let original = "{\n  \"packages\": [\n    {\"name\": \"a\", \"version\": \"1.0.0\"},\n    {\"name\": \"b\", \"version\": \"2.0.0\"}\n  ]\n}\n";
+        fs::write(&file_path, original).unwrap();
 
         let mut updates = BTreeMap::new();
         updates.insert(
@@ -674,20 +1011,16 @@ mod tests {
             apply_version_updates(temp_dir.path(), "9.9.9", &updates, &BTreeMap::new()).unwrap();
 
         assert_eq!(report.changed_files, vec![PathBuf::from("package.json")]);
-        let content = fs::read_to_string(file_path).unwrap();
-        assert!(content.contains("\"name\": \"a\",\n      \"version\": \"1.0.0\""));
-        assert!(content.contains("\"name\": \"b\",\n      \"version\": \"9.9.9\""));
+        let expected = "{\n  \"packages\": [\n    {\"name\": \"a\", \"version\": \"1.0.0\"},\n    {\"name\": \"b\", \"version\": \"9.9.9\"}\n  ]\n}\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
     }
 
     #[test]
-    fn updates_all_json_filter_matches() {
+    fn updates_all_json_filter_matches_without_reformatting() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("package.json");
-        fs::write(
-            &file_path,
-            "{\n  \"package\": [\n    {\"name\": \"brel\", \"version\": \"1.0.0\"},\n    {\"name\": \"other\", \"version\": \"2.0.0\"},\n    {\"name\": \"brel\", \"version\": \"3.0.0\"}\n  ]\n}\n",
-        )
-        .unwrap();
+        let original = "{\n  \"package\": [\n    {\"name\": \"brel\", \"version\": \"1.0.0\"},\n    {\"name\": \"other\", \"version\": \"2.0.0\"},\n    {\"name\": \"brel\", \"version\": \"3.0.0\"}\n  ]\n}\n";
+        fs::write(&file_path, original).unwrap();
 
         let mut updates = BTreeMap::new();
         updates.insert(
@@ -699,9 +1032,8 @@ mod tests {
             apply_version_updates(temp_dir.path(), "7.7.7", &updates, &BTreeMap::new()).unwrap();
 
         assert_eq!(report.changed_files, vec![PathBuf::from("package.json")]);
-        let content = fs::read_to_string(file_path).unwrap();
-        assert_eq!(content.matches("\"version\": \"7.7.7\"").count(), 2);
-        assert!(content.contains("\"version\": \"2.0.0\""));
+        let expected = "{\n  \"package\": [\n    {\"name\": \"brel\", \"version\": \"7.7.7\"},\n    {\"name\": \"other\", \"version\": \"2.0.0\"},\n    {\"name\": \"brel\", \"version\": \"7.7.7\"}\n  ]\n}\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
     }
 
     #[test]
