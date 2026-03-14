@@ -7,6 +7,7 @@
 - `brel init` generates a managed GitHub Actions workflow.
 - `brel release-pr` computes the next version, updates configured files, commits, pushes, and creates/updates a release PR.
 - `brel next-version` computes the next releasable version and prints it as plain SemVer.
+- `brel validate` validates a config file and prints warnings for ignored keys.
 
 ## `release-pr` Prerequisites
 
@@ -22,6 +23,8 @@
 1. `--config <path>` (when provided)
 2. `brel.toml`
 3. `.brel.toml`
+
+Use `brel validate` to check that an existing config file parses and satisfies the current schema before running other commands.
 
 ### Minimal `release-pr` config
 
@@ -205,6 +208,12 @@ Run with explicit config:
 
 ```bash
 brel release-pr --config ./configs/release.toml
+```
+
+Validate config:
+
+```bash
+brel validate
 ```
 
 Preview the next release version:

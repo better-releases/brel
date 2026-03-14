@@ -125,6 +125,106 @@ tag_template = "release-{version}"
 }
 
 #[test]
+fn validate_succeeds_with_discovered_config() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(temp_dir.path().join("brel.toml"), "provider = \"github\"\n").unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("validate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config file `"))
+        .stdout(predicate::str::contains("/brel.toml` is valid."))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn validate_succeeds_with_explicit_config_path() {
+    let temp_dir = tempdir().unwrap();
+    let config_path = temp_dir.path().join("custom.toml");
+    fs::write(&config_path, "provider = \"gitlab\"\n").unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["validate", "--config", "custom.toml"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Config file `custom.toml` is valid.",
+        ))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn validate_fails_when_no_config_exists() {
+    let temp_dir = tempdir().unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("validate")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No config file found to validate. Create `brel.toml` or pass `--config <path>`.",
+        ));
+}
+
+#[test]
+fn validate_fails_on_invalid_toml() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(temp_dir.path().join("brel.toml"), "provider = [").unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("validate")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not valid TOML"));
+}
+
+#[test]
+fn validate_fails_on_semantic_config_errors() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr]
+release_branch_pattern = "brel/release/{{date}}"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("validate")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported token"));
+}
+
+#[test]
+fn validate_prints_warnings_but_succeeds() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        "provider = \"github\"\nexperimental = true\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("validate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config file `"))
+        .stdout(predicate::str::contains("/brel.toml` is valid."))
+        .stderr(predicate::str::contains(
+            "warning: Unknown config key `experimental` was ignored.",
+        ));
+}
+
+#[test]
 fn init_without_config_creates_default_workflow() {
     let temp_dir = tempdir().unwrap();
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));

@@ -4,6 +4,7 @@ mod init;
 mod release_pr;
 mod tag_template;
 mod template;
+mod validate;
 mod version_selector;
 mod version_update;
 mod workflow;
@@ -25,5 +26,6 @@ fn run() -> Result<()> {
         Commands::Init(args) => init::run(args),
         Commands::ReleasePr(args) => release_pr::run(args),
         Commands::NextVersion(args) => release_pr::run_next_version(args),
+        Commands::Validate(args) => validate::run(args),
     }
 }
