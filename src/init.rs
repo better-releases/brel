@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use dialoguer::{Confirm, Select};
 use similar::TextDiff;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, value};
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
@@ -107,6 +108,7 @@ pub(crate) fn run_with_interactor(
         options.yes,
         interactor,
     )?;
+    persist_selected_default_branch(repo_root, options, &config.source, &selected_branch)?;
 
     let workflow_path = workflow::resolve_workflow_path(&config.workflow_file)?;
     let workflow_absolute_path = repo_root.join(&workflow_path);
@@ -122,7 +124,7 @@ pub(crate) fn run_with_interactor(
         config.provider,
         WorkflowTemplate::ReleasePr,
         &WorkflowRenderContext {
-            default_branch: &selected_branch,
+            default_branch: &selected_branch.branch,
             release_pr_command: &release_pr_command,
             next_version_command: &next_version_command,
             github_token_expr: "${{ github.token }}",
@@ -204,6 +206,25 @@ enum FileAction {
     Skip(&'static str),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedDefaultBranch {
+    branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigPersistencePlan {
+    Create(PathBuf),
+    Update(PathBuf),
+}
+
+impl ConfigPersistencePlan {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Create(path) | Self::Update(path) => path.as_path(),
+        }
+    }
+}
+
 fn plan_file_action(
     workflow_path: &Path,
     existing: Option<&str>,
@@ -243,13 +264,17 @@ pub(crate) fn resolve_default_branch(
     repo_default_branch: Option<&str>,
     yes: bool,
     interactor: &mut dyn Interactor,
-) -> Result<String> {
+) -> Result<ResolvedDefaultBranch> {
     let Some(repo_branch) = repo_default_branch else {
-        return Ok(configured_branch.to_string());
+        return Ok(ResolvedDefaultBranch {
+            branch: configured_branch.to_string(),
+        });
     };
 
     if repo_branch == configured_branch {
-        return Ok(configured_branch.to_string());
+        return Ok(ResolvedDefaultBranch {
+            branch: configured_branch.to_string(),
+        });
     }
 
     if yes {
@@ -269,7 +294,118 @@ pub(crate) fn resolve_default_branch(
     }
 
     println!("Using branch `{selected}` for generated workflow triggers.");
-    Ok(selected)
+    Ok(ResolvedDefaultBranch { branch: selected })
+}
+
+fn persist_selected_default_branch(
+    repo_root: &Path,
+    options: &InitOptions,
+    config_source: &ConfigSource,
+    selected_branch: &ResolvedDefaultBranch,
+) -> Result<()> {
+    let Some(plan) = plan_config_persistence(repo_root, config_source, &selected_branch.branch)?
+    else {
+        return Ok(());
+    };
+
+    let display_path = display_repo_path(repo_root, plan.path());
+    if options.dry_run {
+        match plan {
+            ConfigPersistencePlan::Create(_) => {
+                println!(
+                    "Dry run: would create `{display_path}` with `default_branch = \"{}\"`",
+                    selected_branch.branch
+                );
+            }
+            ConfigPersistencePlan::Update(_) => {
+                println!(
+                    "Dry run: would update `{display_path}` to `default_branch = \"{}\"`",
+                    selected_branch.branch
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    match plan {
+        ConfigPersistencePlan::Create(path) => {
+            write_new_default_branch_config(&path, &selected_branch.branch)?;
+            let display_path = display_repo_path(repo_root, &path);
+            println!(
+                "Created `{display_path}` with `default_branch = \"{}\"`.",
+                selected_branch.branch
+            );
+        }
+        ConfigPersistencePlan::Update(path) => {
+            update_default_branch_config(&path, &selected_branch.branch)?;
+            let display_path = display_repo_path(repo_root, &path);
+            println!(
+                "Updated `{display_path}` with `default_branch = \"{}\"`.",
+                selected_branch.branch
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn plan_config_persistence(
+    repo_root: &Path,
+    config_source: &ConfigSource,
+    branch: &str,
+) -> Result<Option<ConfigPersistencePlan>> {
+    match config_source {
+        ConfigSource::Defaulted => Ok(Some(ConfigPersistencePlan::Create(
+            repo_root.join("brel.toml"),
+        ))),
+        ConfigSource::Explicit(path) | ConfigSource::Discovered(path) => {
+            let current = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config file `{}`.", path.display()))?;
+            let document = current.parse::<DocumentMut>().with_context(|| {
+                format!(
+                    "Failed to update config file `{}` as editable TOML.",
+                    path.display()
+                )
+            })?;
+            let existing = document
+                .get("default_branch")
+                .and_then(|item| item.as_str());
+
+            if existing == Some(branch) {
+                Ok(None)
+            } else {
+                Ok(Some(ConfigPersistencePlan::Update(path.clone())))
+            }
+        }
+    }
+}
+
+fn write_new_default_branch_config(path: &Path, branch: &str) -> Result<()> {
+    let mut document = DocumentMut::new();
+    document["default_branch"] = value(branch);
+    fs::write(path, document.to_string())
+        .with_context(|| format!("Failed to write config file `{}`.", path.display()))
+}
+
+fn update_default_branch_config(path: &Path, branch: &str) -> Result<()> {
+    let current = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config file `{}`.", path.display()))?;
+    let mut document = current.parse::<DocumentMut>().with_context(|| {
+        format!(
+            "Failed to update config file `{}` as editable TOML.",
+            path.display()
+        )
+    })?;
+    document["default_branch"] = value(branch);
+    fs::write(path, document.to_string())
+        .with_context(|| format!("Failed to write config file `{}`.", path.display()))
+}
+
+fn display_repo_path(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 fn print_defaults_summary() {
@@ -347,6 +483,7 @@ fn print_diff(before: &str, after: &str) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::process::Command;
     use tempfile::tempdir;
 
     #[derive(Default)]
@@ -385,12 +522,41 @@ mod tests {
         }
     }
 
+    fn init_options_with_config(config_path: PathBuf, yes: bool, dry_run: bool) -> InitOptions {
+        InitOptions {
+            config_path: Some(config_path),
+            yes,
+            dry_run,
+        }
+    }
+
+    fn run_git(repo_root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn set_origin_head(repo_root: &Path, branch: &str) {
+        run_git(repo_root, &["init"]);
+        let target = format!("refs/remotes/origin/{branch}");
+        run_git(
+            repo_root,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", &target],
+        );
+    }
+
     #[test]
     fn no_config_creates_default_workflow() {
         let temp_dir = tempdir().unwrap();
         let mut interactor = MockInteractor::default();
 
         run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
+        assert!(config.contains("default_branch = \"main\""));
 
         let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
         let content = fs::read_to_string(workflow).unwrap();
@@ -574,6 +740,154 @@ tag_template = "release-{version}-prod"
     }
 
     #[test]
+    fn branch_choice_creates_brel_toml_when_config_is_defaulted() {
+        let temp_dir = tempdir().unwrap();
+        set_origin_head(temp_dir.path(), "develop");
+        let mut interactor = MockInteractor {
+            selected_branch: RefCell::new(Some("develop".to_string())),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
+        assert!(config.contains("default_branch = \"develop\""));
+
+        let workflow =
+            fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
+        assert!(workflow.contains("- develop"));
+        assert_eq!(interactor.branch_select_calls, 1);
+    }
+
+    #[test]
+    fn branch_choice_updates_discovered_config() {
+        let temp_dir = tempdir().unwrap();
+        set_origin_head(temp_dir.path(), "develop");
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            "# keep me\nprovider = \"github\"\ndefault_branch = \"main\"\n[release_pr.changelog]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut interactor = MockInteractor {
+            selected_branch: RefCell::new(Some("develop".to_string())),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
+        assert!(config.contains("# keep me"));
+        assert!(config.contains("provider = \"github\""));
+        assert!(config.contains("default_branch = \"develop\""));
+        assert!(config.contains("[release_pr.changelog]"));
+        assert!(config.contains("enabled = false"));
+        assert!(!config.contains("default_branch = \"main\""));
+    }
+
+    #[test]
+    fn branch_choice_updates_explicit_config() {
+        let temp_dir = tempdir().unwrap();
+        set_origin_head(temp_dir.path(), "develop");
+        let config_path = temp_dir.path().join("custom.toml");
+        fs::write(
+            &config_path,
+            "workflow_file = \"custom.yml\"\ndefault_branch = \"main\"\n",
+        )
+        .unwrap();
+        let mut interactor = MockInteractor {
+            selected_branch: RefCell::new(Some("develop".to_string())),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options_with_config(config_path.clone(), false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("workflow_file = \"custom.yml\""));
+        assert!(config.contains("default_branch = \"develop\""));
+        assert!(!config.contains("default_branch = \"main\""));
+    }
+
+    #[test]
+    fn init_adds_default_branch_to_existing_config_when_it_was_implicit() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            "[release_pr.changelog]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
+        assert!(config.contains("default_branch = \"main\""));
+        assert!(config.contains("[release_pr.changelog]"));
+        assert!(config.contains("enabled = false"));
+    }
+
+    #[test]
+    fn dry_run_does_not_mutate_config_when_branch_choice_would_persist() {
+        let temp_dir = tempdir().unwrap();
+        set_origin_head(temp_dir.path(), "develop");
+        let config_path = temp_dir.path().join("brel.toml");
+        let original = "default_branch = \"main\"\n";
+        fs::write(&config_path, original).unwrap();
+        let mut interactor = MockInteractor {
+            selected_branch: RefCell::new(Some("develop".to_string())),
+            ..Default::default()
+        };
+
+        run_with_interactor(temp_dir.path(), &init_options(false, true), &mut interactor).unwrap();
+
+        let config = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(config, original);
+        assert!(
+            !temp_dir
+                .path()
+                .join(".github/workflows/release-pr.yml")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn choosing_configured_branch_does_not_rewrite_config() {
+        let temp_dir = tempdir().unwrap();
+        set_origin_head(temp_dir.path(), "develop");
+        let config_path = temp_dir.path().join("brel.toml");
+        let original = "# keep me\ndefault_branch = \"main\"\n";
+        fs::write(&config_path, original).unwrap();
+        let mut interactor = MockInteractor {
+            selected_branch: RefCell::new(Some("main".to_string())),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(config, original);
+    }
+
+    #[test]
     fn branch_mismatch_can_be_resolved_interactively() {
         let mut interactor = MockInteractor {
             selected_branch: RefCell::new(Some("main".to_string())),
@@ -582,7 +896,12 @@ tag_template = "release-{version}-prod"
 
         let branch =
             resolve_default_branch("develop", Some("main"), false, &mut interactor).unwrap();
-        assert_eq!(branch, "main");
+        assert_eq!(
+            branch,
+            ResolvedDefaultBranch {
+                branch: "main".to_string(),
+            }
+        );
         assert_eq!(interactor.branch_select_calls, 1);
     }
 

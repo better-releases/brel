@@ -137,6 +137,9 @@ fn init_without_config_creates_default_workflow() {
             "No config file found. Using defaults",
         ));
 
+    let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
+    assert!(config.contains("default_branch = \"main\""));
+
     let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
     let content = fs::read_to_string(workflow).unwrap();
     assert!(content.contains("# managed-by: brel"));
