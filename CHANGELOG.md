@@ -1,3 +1,9 @@
+## [0.6.0] - 2026-03-14
+
+### 🚀 Features
+
+- Store selected branch in brel.toml on init
+- Validate command
 ## [0.5.0] - 2026-02-18
 
 ### 🚀 Features
