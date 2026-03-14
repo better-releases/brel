@@ -1,3 +1,8 @@
+## [0.7.0] - 2026-03-14
+
+### 🚀 Features
+
+- Custom json ast parser
 ## [0.6.0] - 2026-03-14
 
 ### 🚀 Features
