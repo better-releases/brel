@@ -2,6 +2,65 @@
 
 `brel` is a CLI that scaffolds and runs the better-releases workflow.
 
+## Install
+
+Choose the install path that fits how you want to use `brel`:
+
+Install from crates.io:
+
+```bash
+cargo install brel
+```
+
+Install with Homebrew:
+
+```bash
+brew install better-releases/tap/brel
+```
+
+Run the published npm package once with `npx`:
+
+```bash
+npx brel@latest --help
+```
+
+Install the latest prebuilt binary with the release shell script:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/better-releases/brel/releases/latest/download/brel-installer.sh | sh
+```
+
+Download a platform archive directly from the [latest release page](https://github.com/better-releases/brel/releases/latest).
+
+Install from this checkout while developing locally:
+
+```bash
+cargo install --path .
+```
+
+## Quick Start
+
+Create a `brel.toml` for the most basic `release-pr` setup:
+
+```toml
+# GitHub is the default provider, but keeping it explicit makes the file clearer.
+provider = "github"
+
+# Release PRs target this branch.
+default_branch = "main"
+
+[release_pr.version_updates]
+# Update the root package version in package.json on each release PR.
+"package.json" = ["version"]
+```
+
+Then validate the config and generate the managed workflow:
+
+```bash
+brel validate
+brel init --yes
+```
+
 ## Commands
 
 - `brel init` generates a managed GitHub Actions workflow.
@@ -29,10 +88,14 @@ Use `brel validate` to check that an existing config file parses and satisfies t
 ### Minimal `release-pr` config
 
 ```toml
+# GitHub is the default provider, but keeping it explicit makes the file clearer.
 provider = "github"
+
+# Release PRs target this branch.
 default_branch = "main"
 
 [release_pr.version_updates]
+# Update the root package version in package.json on each release PR.
 "package.json" = ["version"]
 ```
 
