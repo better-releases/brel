@@ -39,12 +39,26 @@ jobs:
           echo "version=${next_version}" >> "${GITHUB_OUTPUT}"
 
 {{#if changelog_enabled}}
+{{#if changelog_provider_git_cliff}}
       - name: Generate changelog
         if: {{next_version_non_empty_expr}}
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --unreleased --tag {{next_version_tag_output_expr}} --prepend {{changelog_output_file}}
+{{/if}}
+{{#if changelog_provider_changelogen}}
+      - name: Setup Node
+        if: {{next_version_non_empty_expr}}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Generate changelog
+        if: {{next_version_non_empty_expr}}
+        run: npx --yes {{changelogen_package_shell}} --to HEAD -r "{{next_version_output_expr}}" --output {{changelog_output_file_shell}}
+{{/if}}
 
 {{/if}}
       - name: Generate release PR

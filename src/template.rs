@@ -1,4 +1,4 @@
-use crate::config::Provider;
+use crate::config::{ChangelogProvider, Provider};
 use anyhow::{Context, Result, bail};
 use handlebars::{Handlebars, no_escape};
 use serde::Serialize;
@@ -8,7 +8,7 @@ pub enum WorkflowTemplate {
     ReleasePr,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct WorkflowRenderContext<'a> {
     pub default_branch: &'a str,
     pub release_pr_command: &'a str,
@@ -19,7 +19,31 @@ pub struct WorkflowRenderContext<'a> {
     pub next_version_output_expr: &'a str,
     pub next_version_tag_output_expr: &'a str,
     pub changelog_enabled: bool,
+    pub changelog_provider: ChangelogProvider,
     pub changelog_output_file: &'a str,
+    pub changelog_output_file_shell: &'a str,
+    pub changelogen_package_shell: &'a str,
+    pub tagging_enabled: bool,
+    pub tagging_template_prefix_shell: &'a str,
+    pub tagging_template_suffix_shell: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct GithubWorkflowRenderContext<'a> {
+    pub default_branch: &'a str,
+    pub release_pr_command: &'a str,
+    pub next_version_command: &'a str,
+    pub github_token_expr: &'a str,
+    pub tagging_push_token_expr: &'a str,
+    pub next_version_non_empty_expr: &'a str,
+    pub next_version_output_expr: &'a str,
+    pub next_version_tag_output_expr: &'a str,
+    pub changelog_enabled: bool,
+    pub changelog_provider_git_cliff: bool,
+    pub changelog_provider_changelogen: bool,
+    pub changelog_output_file: &'a str,
+    pub changelog_output_file_shell: &'a str,
+    pub changelogen_package_shell: &'a str,
     pub tagging_enabled: bool,
     pub tagging_template_prefix_shell: &'a str,
     pub tagging_template_suffix_shell: &'a str,
@@ -67,12 +91,47 @@ pub fn render_workflow(
 ) -> Result<String> {
     match (provider, template) {
         (Provider::Github, WorkflowTemplate::ReleasePr) => {
-            render_template("github-release-pr", GITHUB_RELEASE_PR_TEMPLATE, context)
+            let github_context = github_workflow_render_context(context);
+            render_template(
+                "github-release-pr",
+                GITHUB_RELEASE_PR_TEMPLATE,
+                &github_context,
+            )
         }
         (provider, _) => bail!(
             "Provider `{}` is not supported by workflow renderer in v1.",
             provider.as_str()
         ),
+    }
+}
+
+fn github_workflow_render_context<'a>(
+    context: &WorkflowRenderContext<'a>,
+) -> GithubWorkflowRenderContext<'a> {
+    GithubWorkflowRenderContext {
+        default_branch: context.default_branch,
+        release_pr_command: context.release_pr_command,
+        next_version_command: context.next_version_command,
+        github_token_expr: context.github_token_expr,
+        tagging_push_token_expr: context.tagging_push_token_expr,
+        next_version_non_empty_expr: context.next_version_non_empty_expr,
+        next_version_output_expr: context.next_version_output_expr,
+        next_version_tag_output_expr: context.next_version_tag_output_expr,
+        changelog_enabled: context.changelog_enabled,
+        changelog_provider_git_cliff: matches!(
+            context.changelog_provider,
+            ChangelogProvider::GitCliff
+        ),
+        changelog_provider_changelogen: matches!(
+            context.changelog_provider,
+            ChangelogProvider::Changelogen
+        ),
+        changelog_output_file: context.changelog_output_file,
+        changelog_output_file_shell: context.changelog_output_file_shell,
+        changelogen_package_shell: context.changelogen_package_shell,
+        tagging_enabled: context.tagging_enabled,
+        tagging_template_prefix_shell: context.tagging_template_prefix_shell,
+        tagging_template_suffix_shell: context.tagging_template_suffix_shell,
     }
 }
 
@@ -115,7 +174,10 @@ mod tests {
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
                 changelog_enabled: true,
+                changelog_provider: ChangelogProvider::GitCliff,
                 changelog_output_file: "CHANGELOG.md",
+                changelog_output_file_shell: "CHANGELOG.md",
+                changelogen_package_shell: "'changelogen@0.6.2'",
                 tagging_enabled: false,
                 tagging_template_prefix_shell: "'v'",
                 tagging_template_suffix_shell: "''",
@@ -135,6 +197,8 @@ mod tests {
         ));
         assert!(!rendered.contains("--output CHANGELOG.md"));
         assert!(rendered.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!rendered.contains("uses: actions/setup-node@v6"));
+        assert!(!rendered.contains("changelogen@"));
         assert!(rendered.contains("uses: better-releases/setup-brel@v1"));
         assert!(!rendered.contains("BREL_RELEASE_REPO"));
         assert!(!rendered.contains("Create release tag"));
@@ -156,7 +220,10 @@ mod tests {
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
                 changelog_enabled: false,
+                changelog_provider: ChangelogProvider::GitCliff,
                 changelog_output_file: "CHANGELOG.md",
+                changelog_output_file_shell: "CHANGELOG.md",
+                changelogen_package_shell: "'changelogen@0.6.2'",
                 tagging_enabled: false,
                 tagging_template_prefix_shell: "'v'",
                 tagging_template_suffix_shell: "''",
@@ -165,6 +232,48 @@ mod tests {
         .unwrap();
 
         assert!(!rendered.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!rendered.contains("uses: actions/setup-node@v6"));
+        assert!(!rendered.contains("changelogen@"));
+    }
+
+    #[test]
+    fn renders_changelogen_changelog_steps() {
+        let rendered = render_workflow(
+            Provider::Github,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                next_version_command: "brel next-version",
+                github_token_expr: "${{ github.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
+                next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
+                next_version_output_expr: "${{ steps.next-version.outputs.version }}",
+                next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
+                changelog_enabled: true,
+                changelog_provider: ChangelogProvider::Changelogen,
+                changelog_output_file: "docs/changelog.md",
+                changelog_output_file_shell: "docs/changelog.md",
+                changelogen_package_shell: "'changelogen@0.6.2'",
+                tagging_enabled: false,
+                tagging_template_prefix_shell: "'v'",
+                tagging_template_suffix_shell: "''",
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("uses: actions/setup-node@v6"));
+        assert!(rendered.contains("node-version: 24"));
+        assert!(rendered.contains("package-manager-cache: false"));
+        assert!(rendered.contains(
+            "run: npx --yes 'changelogen@0.6.2' --to HEAD -r \"${{ steps.next-version.outputs.version }}\" --output docs/changelog.md"
+        ));
+        assert!(!rendered.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!rendered.contains("--bump"));
+        assert!(!rendered.contains("--release"));
+        assert!(!rendered.contains("--commit"));
+        assert!(!rendered.contains("--tag"));
+        assert!(!rendered.contains("--push"));
     }
 
     #[test]
@@ -182,7 +291,10 @@ mod tests {
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "v${{ steps.next-version.outputs.version }}",
                 changelog_enabled: true,
+                changelog_provider: ChangelogProvider::GitCliff,
                 changelog_output_file: "CHANGELOG.md",
+                changelog_output_file_shell: "CHANGELOG.md",
+                changelogen_package_shell: "'changelogen@0.6.2'",
                 tagging_enabled: true,
                 tagging_template_prefix_shell: "'v'",
                 tagging_template_suffix_shell: "''",
@@ -218,7 +330,10 @@ mod tests {
                 next_version_output_expr: "${{ steps.next-version.outputs.version }}",
                 next_version_tag_output_expr: "release-${{ steps.next-version.outputs.version }}",
                 changelog_enabled: true,
+                changelog_provider: ChangelogProvider::GitCliff,
                 changelog_output_file: "CHANGELOG.md",
+                changelog_output_file_shell: "CHANGELOG.md",
+                changelogen_package_shell: "'changelogen@0.6.2'",
                 tagging_enabled: true,
                 tagging_template_prefix_shell: "release-",
                 tagging_template_suffix_shell: "''",

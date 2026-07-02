@@ -120,6 +120,13 @@ pub(crate) fn run_with_interactor(
     let next_version_tag_output_expr = tag_template.render(next_version_output_expr);
     let tagging_template_prefix_shell = tag_template::shell_escape_single(tag_template.prefix());
     let tagging_template_suffix_shell = tag_template::shell_escape_single(tag_template.suffix());
+    let changelog_output_file_shell =
+        tag_template::shell_escape_single(&config.release_pr.changelog.output_file);
+    let changelogen_package = format!(
+        "changelogen@{}",
+        config.release_pr.changelog.changelogen.version
+    );
+    let changelogen_package_shell = tag_template::shell_escape_single(&changelogen_package);
     let rendered = template::render_workflow(
         config.provider,
         WorkflowTemplate::ReleasePr,
@@ -133,7 +140,10 @@ pub(crate) fn run_with_interactor(
             next_version_output_expr,
             next_version_tag_output_expr: &next_version_tag_output_expr,
             changelog_enabled: config.release_pr.changelog.enabled,
+            changelog_provider: config.release_pr.changelog.provider,
             changelog_output_file: &config.release_pr.changelog.output_file,
+            changelog_output_file_shell: &changelog_output_file_shell,
+            changelogen_package_shell: &changelogen_package_shell,
             tagging_enabled: config.release_pr.tagging.enabled,
             tagging_template_prefix_shell: &tagging_template_prefix_shell,
             tagging_template_suffix_shell: &tagging_template_suffix_shell,
@@ -574,6 +584,8 @@ mod tests {
         assert!(content.contains("--prepend CHANGELOG.md"));
         assert!(!content.contains("--output CHANGELOG.md"));
         assert!(content.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!content.contains("uses: actions/setup-node@v6"));
+        assert!(!content.contains("changelogen@"));
         assert!(!content.contains("pull_request:"));
     }
 
@@ -594,6 +606,35 @@ enabled = false
 
         let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
         let content = fs::read_to_string(workflow).unwrap();
+        assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!content.contains("uses: actions/setup-node@v6"));
+        assert!(!content.contains("changelogen@"));
+    }
+
+    #[test]
+    fn changelogen_changelog_provider_updates_workflow() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.changelog]
+provider = "changelogen"
+output_file = "docs/changelog.md"
+"#,
+        )
+        .unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+        let content = fs::read_to_string(workflow).unwrap();
+        assert!(content.contains("uses: actions/setup-node@v6"));
+        assert!(content.contains("node-version: 24"));
+        assert!(content.contains("package-manager-cache: false"));
+        assert!(content.contains(
+            "run: npx --yes 'changelogen@0.6.2' --to HEAD -r \"${{ steps.next-version.outputs.version }}\" --output docs/changelog.md"
+        ));
         assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
     }
 
