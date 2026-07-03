@@ -1,6 +1,7 @@
 use crate::tag_template;
 use crate::version_selector;
 use anyhow::{Context, Result, bail};
+use semver::Version;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -14,6 +15,7 @@ pub const DEFAULT_RELEASE_BRANCH_PATTERN: &str = "brel/release/v{{version}}";
 pub const DEFAULT_COMMIT_AUTHOR_NAME: &str = "brel[bot]";
 pub const DEFAULT_COMMIT_AUTHOR_EMAIL: &str = "brel[bot]@users.noreply.github.com";
 pub const DEFAULT_CHANGELOG_OUTPUT_FILE: &str = "CHANGELOG.md";
+pub const DEFAULT_CHANGELOGEN_VERSION: &str = "0.6.2";
 pub const DEFAULT_TAGGING_ENABLED: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,41 @@ impl FromStr for Provider {
             "gitlab" => Ok(Self::Gitlab),
             "gitea" => Ok(Self::Gitea),
             other => bail!("Unsupported provider `{other}` in config."),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogProvider {
+    GitCliff,
+    Changelogen,
+}
+
+impl ChangelogProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GitCliff => "git-cliff",
+            Self::Changelogen => "changelogen",
+        }
+    }
+}
+
+impl fmt::Display for ChangelogProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str((*self).as_str())
+    }
+}
+
+impl FromStr for ChangelogProvider {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "git-cliff" => Ok(Self::GitCliff),
+            "changelogen" => Ok(Self::Changelogen),
+            other => bail!(
+                "Unsupported `release_pr.changelog.provider` value `{other}`. Expected `git-cliff` or `changelogen`."
+            ),
         }
     }
 }
@@ -110,7 +147,14 @@ pub struct CommitAuthorConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogConfig {
     pub enabled: bool,
+    pub provider: ChangelogProvider,
     pub output_file: String,
+    pub changelogen: ChangelogenConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelogenConfig {
+    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +187,11 @@ impl Default for ReleasePrConfig {
             },
             changelog: ChangelogConfig {
                 enabled: true,
+                provider: ChangelogProvider::GitCliff,
                 output_file: DEFAULT_CHANGELOG_OUTPUT_FILE.to_string(),
+                changelogen: ChangelogenConfig {
+                    version: DEFAULT_CHANGELOGEN_VERSION.to_string(),
+                },
             },
             tagging: TaggingConfig {
                 enabled: DEFAULT_TAGGING_ENABLED,
@@ -191,7 +239,14 @@ struct RawCommitAuthorConfig {
 #[derive(Debug, Default, Deserialize)]
 struct RawChangelogConfig {
     enabled: Option<bool>,
+    provider: Option<String>,
     output_file: Option<String>,
+    changelogen: Option<RawChangelogenConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawChangelogenConfig {
+    version: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -361,6 +416,12 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
 
     let raw_changelog = raw_release_pr.changelog.unwrap_or_default();
     let changelog_enabled = raw_changelog.enabled.unwrap_or(true);
+    let changelog_provider = raw_changelog
+        .provider
+        .as_deref()
+        .map(ChangelogProvider::from_str)
+        .transpose()?
+        .unwrap_or(ChangelogProvider::GitCliff);
     let changelog_output_file = normalize_repo_relative_path(
         raw_changelog
             .output_file
@@ -368,6 +429,13 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
             .unwrap_or(DEFAULT_CHANGELOG_OUTPUT_FILE),
         "`release_pr.changelog.output_file` path",
     )?;
+    let raw_changelogen = raw_changelog.changelogen.unwrap_or_default();
+    let changelogen_version = match changelog_provider {
+        ChangelogProvider::Changelogen => {
+            normalize_changelogen_version(raw_changelogen.version.as_deref())?
+        }
+        ChangelogProvider::GitCliff => DEFAULT_CHANGELOGEN_VERSION.to_string(),
+    };
     let raw_tagging = raw_release_pr.tagging.unwrap_or_default();
     let tagging_enabled = raw_tagging.enabled.unwrap_or(DEFAULT_TAGGING_ENABLED);
     let tag_template = tag_template::normalize_tag_template(
@@ -389,7 +457,11 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         },
         changelog: ChangelogConfig {
             enabled: changelog_enabled,
+            provider: changelog_provider,
             output_file: changelog_output_file,
+            changelogen: ChangelogenConfig {
+                version: changelogen_version,
+            },
         },
         tagging: TaggingConfig {
             enabled: tagging_enabled,
@@ -420,6 +492,22 @@ fn normalize_repo_relative_path(value: &str, label: &str) -> Result<String> {
                 bail!("{label} `{trimmed}` must be repository-relative.");
             }
         }
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn normalize_changelogen_version(value: Option<&str>) -> Result<String> {
+    let trimmed = value.unwrap_or(DEFAULT_CHANGELOGEN_VERSION).trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_CHANGELOGEN_VERSION.to_string());
+    }
+
+    if Version::parse(trimmed).is_err() {
+        bail!(
+            "`release_pr.changelog.changelogen.version` must be a SemVer version like `{}`.",
+            DEFAULT_CHANGELOGEN_VERSION
+        );
     }
 
     Ok(trimmed.to_string())
@@ -524,7 +612,8 @@ fn collect_release_pr_nested_warnings(
     mut warnings: Vec<String>,
 ) -> Vec<String> {
     if let Some(changelog) = release_pr.get("changelog").and_then(toml::Value::as_table) {
-        let allowed_changelog: BTreeSet<&str> = BTreeSet::from(["enabled", "output_file"]);
+        let allowed_changelog: BTreeSet<&str> =
+            BTreeSet::from(["enabled", "provider", "output_file", "changelogen"]);
         for key in changelog
             .keys()
             .filter(|key| !allowed_changelog.contains(key.as_str()))
@@ -532,6 +621,18 @@ fn collect_release_pr_nested_warnings(
             warnings.push(format!(
                 "Unknown config key `release_pr.changelog.{key}` was ignored."
             ));
+        }
+
+        if let Some(changelogen) = changelog.get("changelogen").and_then(toml::Value::as_table) {
+            let allowed_changelogen: BTreeSet<&str> = BTreeSet::from(["version"]);
+            for key in changelogen
+                .keys()
+                .filter(|key| !allowed_changelogen.contains(key.as_str()))
+            {
+                warnings.push(format!(
+                    "Unknown config key `release_pr.changelog.changelogen.{key}` was ignored."
+                ));
+            }
         }
     }
 
@@ -625,6 +726,14 @@ mod tests {
             config.release_pr.changelog.output_file,
             DEFAULT_CHANGELOG_OUTPUT_FILE
         );
+        assert_eq!(
+            config.release_pr.changelog.provider,
+            ChangelogProvider::GitCliff
+        );
+        assert_eq!(
+            config.release_pr.changelog.changelogen.version,
+            DEFAULT_CHANGELOGEN_VERSION
+        );
         assert!(!config.release_pr.tagging.enabled);
         assert_eq!(
             config.release_pr.tagging.tag_template,
@@ -715,6 +824,14 @@ email = "release@example.com"
             config.release_pr.changelog.output_file,
             DEFAULT_CHANGELOG_OUTPUT_FILE
         );
+        assert_eq!(
+            config.release_pr.changelog.provider,
+            ChangelogProvider::GitCliff
+        );
+        assert_eq!(
+            config.release_pr.changelog.changelogen.version,
+            DEFAULT_CHANGELOGEN_VERSION
+        );
         assert!(!config.release_pr.tagging.enabled);
         assert_eq!(
             config.release_pr.tagging.tag_template,
@@ -758,14 +875,157 @@ email = "release@example.com"
             r#"
 [release_pr.changelog]
 enabled = false
+provider = "changelogen"
 output_file = "docs/changelog.md"
+
+[release_pr.changelog.changelogen]
+version = "0.5.0"
 "#,
         )
         .unwrap();
 
         let config = load(None, cwd).unwrap();
         assert!(!config.release_pr.changelog.enabled);
+        assert_eq!(
+            config.release_pr.changelog.provider,
+            ChangelogProvider::Changelogen
+        );
         assert_eq!(config.release_pr.changelog.output_file, "docs/changelog.md");
+        assert_eq!(config.release_pr.changelog.changelogen.version, "0.5.0");
+    }
+
+    #[test]
+    fn empty_changelogen_version_uses_default() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog.changelogen]
+version = ""
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(
+            config.release_pr.changelog.changelogen.version,
+            DEFAULT_CHANGELOGEN_VERSION
+        );
+    }
+
+    #[test]
+    fn parses_explicit_git_cliff_changelog_provider() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog]
+provider = "git-cliff"
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(
+            config.release_pr.changelog.provider,
+            ChangelogProvider::GitCliff
+        );
+    }
+
+    #[test]
+    fn default_git_cliff_provider_ignores_invalid_changelogen_version() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog.changelogen]
+version = "latest"
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(
+            config.release_pr.changelog.provider,
+            ChangelogProvider::GitCliff
+        );
+        assert_eq!(
+            config.release_pr.changelog.changelogen.version,
+            DEFAULT_CHANGELOGEN_VERSION
+        );
+    }
+
+    #[test]
+    fn explicit_git_cliff_provider_ignores_invalid_changelogen_version() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog]
+provider = "git-cliff"
+
+[release_pr.changelog.changelogen]
+version = "latest"
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(
+            config.release_pr.changelog.provider,
+            ChangelogProvider::GitCliff
+        );
+        assert_eq!(
+            config.release_pr.changelog.changelogen.version,
+            DEFAULT_CHANGELOGEN_VERSION
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_changelog_provider() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog]
+provider = "town-crier"
+"#,
+        )
+        .unwrap();
+
+        let err = load(None, cwd).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported `release_pr.changelog.provider` value `town-crier`")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_changelogen_version() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.changelog]
+provider = "changelogen"
+
+[release_pr.changelog.changelogen]
+version = "latest"
+"#,
+        )
+        .unwrap();
+
+        let err = load(None, cwd).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`release_pr.changelog.changelogen.version` must be a SemVer version")
+        );
     }
 
     #[test]
@@ -880,7 +1140,12 @@ email = "brel@example.com"
 extra = "x"
 
 [release_pr.changelog]
+provider = "changelogen"
 wat = true
+
+[release_pr.changelog.changelogen]
+version = "0.6.2"
+extra = true
 
 [release_pr.tagging]
 extra = 1
@@ -889,7 +1154,7 @@ extra = 1
         .unwrap();
 
         let config = load(None, cwd).unwrap();
-        assert_eq!(config.warnings.len(), 4);
+        assert_eq!(config.warnings.len(), 5);
         assert!(
             config
                 .warnings
@@ -907,6 +1172,24 @@ extra = 1
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("release_pr.changelog.wat"))
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("release_pr.changelog.provider"))
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("release_pr.changelog.changelogen.extra"))
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("release_pr.changelog.changelogen.version"))
         );
         assert!(
             config

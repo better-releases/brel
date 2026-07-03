@@ -257,6 +257,8 @@ fn init_without_config_creates_default_workflow() {
     assert!(content.contains("--prepend CHANGELOG.md"));
     assert!(!content.contains("--output CHANGELOG.md"));
     assert!(content.contains("uses: orhun/git-cliff-action@v4"));
+    assert!(!content.contains("uses: actions/setup-node@v6"));
+    assert!(!content.contains("changelogen@"));
     assert!(content.contains("run: brel release-pr"));
     assert!(!content.contains("pull_request:"));
 }
@@ -282,6 +284,46 @@ enabled = false
     let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
     let content = fs::read_to_string(workflow).unwrap();
     assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+    assert!(!content.contains("uses: actions/setup-node@v6"));
+    assert!(!content.contains("changelogen@"));
+}
+
+#[test]
+fn init_with_changelogen_changelog_provider_emits_node_steps() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.changelog]
+provider = "changelogen"
+output_file = "docs/changelog.md"
+
+[release_pr.changelog.changelogen]
+version = "0.5.0"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes"])
+        .assert()
+        .success();
+
+    let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+    let content = fs::read_to_string(workflow).unwrap();
+    assert!(content.contains("uses: actions/setup-node@v6"));
+    assert!(content.contains("node-version: 24"));
+    assert!(content.contains("package-manager-cache: false"));
+    assert!(content.contains(
+        "run: npx --yes 'changelogen@0.5.0' --to HEAD -r \"${{ steps.next-version.outputs.version }}\" --output docs/changelog.md"
+    ));
+    assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+    assert!(!content.contains("--bump"));
+    assert!(!content.contains("--release"));
+    assert!(!content.contains("--commit"));
+    assert!(!content.contains("--tag"));
+    assert!(!content.contains("--push"));
 }
 
 #[test]

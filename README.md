@@ -115,7 +115,11 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
 
 [release_pr.changelog]
 enabled = true
+provider = "git-cliff"
 output_file = "CHANGELOG.md"
+
+[release_pr.changelog.changelogen]
+version = "0.6.2"
 
 [release_pr.tagging]
 enabled = false
@@ -182,17 +186,34 @@ Example selectors:
 "Cargo.lock" = "toml"
 ```
 
-## Changelog Generation (`git-cliff`)
+## Changelog Generation
 
 - `brel init` generates a workflow that runs [`orhun/git-cliff-action@v4`](https://github.com/orhun/git-cliff-action) by default.
 - Configure changelog behavior with `[release_pr.changelog]`:
   - `enabled` (default `true`)
+  - `provider` (default `"git-cliff"`, also supports `"changelogen"`)
   - `output_file` (default `"CHANGELOG.md"`)
-- Generated workflow behavior:
+- Configure changelogen-specific behavior with `[release_pr.changelog.changelogen]`:
+  - `version` (default `"0.6.2"`; omitted or empty uses the default; explicit values must be SemVer)
+- Generated `git-cliff` workflow behavior:
   - computes `next-version` first via `brel next-version`
   - runs `git-cliff` only when a next version exists
   - passes `--unreleased --tag <rendered-tag-template>` so the newest changelog section is versioned instead of `[unreleased]`
+- Generated `changelogen` workflow behavior:
+  - sets up Node with `actions/setup-node@v6`
+  - runs `npx --yes changelogen@<configured-version> --to HEAD -r <next-version> --output <output_file>`
+  - does not ask changelogen to bump versions, commit, tag, push, publish, or create GitHub releases
 - If changelog generation is enabled, `brel release-pr` stages `output_file` in the release commit when that file exists.
+- Enable changelogen:
+
+```toml
+[release_pr.changelog]
+provider = "changelogen"
+
+[release_pr.changelog.changelogen]
+version = "0.6.2"
+```
+
 - Disable changelog generation:
 
 ```toml
@@ -200,7 +221,7 @@ Example selectors:
 enabled = false
 ```
 
-- `brel init` does not create or manage `cliff.toml`; keep that file in your repository if you want custom `git-cliff` rules.
+- `brel init` does not create or manage changelog tool config files. Keep `cliff.toml` in your repository for custom `git-cliff` rules, or use changelogen's supported config files (`changelog.config.*`, `.changelogrc`, or `package.json`'s `changelog` field) for custom changelogen behavior.
 
 ## Branch / Commit / PR Behavior
 
