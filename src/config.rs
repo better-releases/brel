@@ -25,13 +25,57 @@ pub enum Provider {
     Gitea,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderChoice {
+    pub provider: Provider,
+    pub config_value: &'static str,
+    pub prompt_label: &'static str,
+    pub init_supported: bool,
+}
+
+const PROVIDER_CHOICES: &[ProviderChoice] = &[
+    ProviderChoice {
+        provider: Provider::Github,
+        config_value: "github",
+        prompt_label: "GitHub",
+        init_supported: true,
+    },
+    ProviderChoice {
+        provider: Provider::Gitlab,
+        config_value: "gitlab",
+        prompt_label: "GitLab",
+        init_supported: false,
+    },
+    ProviderChoice {
+        provider: Provider::Gitea,
+        config_value: "gitea",
+        prompt_label: "Gitea",
+        init_supported: false,
+    },
+];
+
 impl Provider {
+    pub fn choices() -> &'static [ProviderChoice] {
+        PROVIDER_CHOICES
+    }
+
+    pub fn choice(self) -> &'static ProviderChoice {
+        Self::choices()
+            .iter()
+            .find(|choice| choice.provider == self)
+            .expect("every Provider variant must have metadata")
+    }
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Github => "github",
-            Self::Gitlab => "gitlab",
-            Self::Gitea => "gitea",
-        }
+        self.choice().config_value
+    }
+
+    pub fn prompt_label(self) -> &'static str {
+        self.choice().prompt_label
+    }
+
+    pub fn is_init_supported(self) -> bool {
+        self.choice().init_supported
     }
 }
 
@@ -45,11 +89,14 @@ impl FromStr for Provider {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "github" => Ok(Self::Github),
-            "gitlab" => Ok(Self::Gitlab),
-            "gitea" => Ok(Self::Gitea),
-            other => bail!("Unsupported provider `{other}` in config."),
+        let normalized = value.trim().to_ascii_lowercase();
+        if let Some(choice) = Self::choices()
+            .iter()
+            .find(|choice| choice.config_value == normalized)
+        {
+            Ok(choice.provider)
+        } else {
+            bail!("Unsupported provider `{normalized}` in config.")
         }
     }
 }
@@ -680,6 +727,49 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn provider_metadata_is_the_source_of_truth() {
+        let choices = Provider::choices();
+        assert_eq!(choices.len(), 3);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| (
+                    choice.provider,
+                    choice.config_value,
+                    choice.prompt_label,
+                    choice.init_supported
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Provider::Github, "github", "GitHub", true),
+                (Provider::Gitlab, "gitlab", "GitLab", false),
+                (Provider::Gitea, "gitea", "Gitea", false),
+            ]
+        );
+
+        for choice in choices {
+            assert_eq!(choice.provider.as_str(), choice.config_value);
+            assert_eq!(choice.provider.prompt_label(), choice.prompt_label);
+            assert_eq!(choice.provider.is_init_supported(), choice.init_supported);
+            assert_eq!(
+                Provider::from_str(choice.config_value).unwrap(),
+                choice.provider
+            );
+        }
+    }
+
+    #[test]
+    fn init_supported_provider_choices_only_include_github() {
+        let init_supported = Provider::choices()
+            .iter()
+            .filter(|choice| choice.init_supported)
+            .map(|choice| choice.provider)
+            .collect::<Vec<_>>();
+
+        assert_eq!(init_supported, vec![Provider::Github]);
+    }
 
     #[test]
     fn discovers_brel_toml_before_dot_brel_toml() {

@@ -1,10 +1,10 @@
 use crate::cli::InitArgs;
-use crate::config::{self, ConfigSource, Provider};
+use crate::config::{self, ChangelogProvider, ConfigSource, Provider, ProviderChoice};
 use crate::tag_template::{self, TagTemplate};
 use crate::template::{self, WorkflowRenderContext, WorkflowTemplate};
 use crate::workflow;
 use anyhow::{Context, Result, bail};
-use dialoguer::{Confirm, Select};
+use dialoguer::{Confirm, Input, Select};
 use similar::TextDiff;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,11 +19,19 @@ pub struct InitOptions {
 
 pub trait Interactor {
     fn confirm_overwrite(&mut self, workflow_path: &Path) -> Result<bool>;
-    fn choose_branch_for_mismatch(
+    fn choose_provider(
         &mut self,
-        configured_branch: &str,
-        repo_default_branch: &str,
-    ) -> Result<String>;
+        current_provider: Provider,
+        choices: &[ProviderChoice],
+    ) -> Result<Provider>;
+    fn input_default_branch(&mut self, default_branch: &str) -> Result<String>;
+    fn confirm_changelog(&mut self, current: bool) -> Result<bool>;
+    fn choose_changelog_provider(
+        &mut self,
+        current_provider: ChangelogProvider,
+    ) -> Result<ChangelogProvider>;
+    fn confirm_tagging(&mut self, current: bool) -> Result<bool>;
+    fn input_tag_template(&mut self, default_template: &str) -> Result<String>;
 }
 
 struct CliInteractor;
@@ -40,29 +48,88 @@ impl Interactor for CliInteractor {
             .context("Failed to read overwrite confirmation.")
     }
 
-    fn choose_branch_for_mismatch(
+    fn choose_provider(
         &mut self,
-        configured_branch: &str,
-        repo_default_branch: &str,
-    ) -> Result<String> {
-        let options = [
-            format!("Keep config branch `{configured_branch}`"),
-            format!("Use repository default `{repo_default_branch}`"),
-        ];
+        current_provider: Provider,
+        choices: &[ProviderChoice],
+    ) -> Result<Provider> {
+        let options = choices
+            .iter()
+            .map(|choice| choice.provider.prompt_label())
+            .collect::<Vec<_>>();
+        let default = choices
+            .iter()
+            .position(|choice| choice.provider == current_provider)
+            .unwrap_or(0);
         let selection = Select::new()
-            .with_prompt(
-                "Config default_branch does not match repository default branch. Choose branch to use",
-            )
+            .with_prompt("Forge")
             .items(&options)
-            .default(0)
+            .default(default)
             .interact()
-            .context("Failed to read branch selection.")?;
+            .context("Failed to read forge selection.")?;
 
-        match selection {
-            0 => Ok(configured_branch.to_string()),
-            1 => Ok(repo_default_branch.to_string()),
-            _ => bail!("Invalid branch selection."),
-        }
+        choices
+            .get(selection)
+            .map(|choice| choice.provider)
+            .context("Invalid forge selection.")
+    }
+
+    fn input_default_branch(&mut self, default_branch: &str) -> Result<String> {
+        Input::<String>::new()
+            .with_prompt("Main branch")
+            .default(default_branch.to_string())
+            .interact_text()
+            .context("Failed to read main branch.")
+    }
+
+    fn confirm_changelog(&mut self, current: bool) -> Result<bool> {
+        Confirm::new()
+            .with_prompt("Generate changelog?")
+            .default(current)
+            .interact()
+            .context("Failed to read changelog confirmation.")
+    }
+
+    fn choose_changelog_provider(
+        &mut self,
+        current_provider: ChangelogProvider,
+    ) -> Result<ChangelogProvider> {
+        let choices = [ChangelogProvider::GitCliff, ChangelogProvider::Changelogen];
+        let options = choices
+            .iter()
+            .map(|provider| provider.as_str())
+            .collect::<Vec<_>>();
+        let default = choices
+            .iter()
+            .position(|provider| *provider == current_provider)
+            .unwrap_or(0);
+        let selection = Select::new()
+            .with_prompt("Changelog provider")
+            .items(&options)
+            .default(default)
+            .interact()
+            .context("Failed to read changelog provider selection.")?;
+
+        choices
+            .get(selection)
+            .copied()
+            .context("Invalid changelog provider selection.")
+    }
+
+    fn confirm_tagging(&mut self, current: bool) -> Result<bool> {
+        Confirm::new()
+            .with_prompt("Tag release on merge?")
+            .default(current)
+            .interact()
+            .context("Failed to read tagging confirmation.")
+    }
+
+    fn input_tag_template(&mut self, default_template: &str) -> Result<String> {
+        Input::<String>::new()
+            .with_prompt("Tag template")
+            .default(default_template.to_string())
+            .interact_text()
+            .context("Failed to read tag template.")
     }
 }
 
@@ -83,7 +150,7 @@ pub(crate) fn run_with_interactor(
     options: &InitOptions,
     interactor: &mut dyn Interactor,
 ) -> Result<()> {
-    let config = config::load(options.config_path.as_deref(), repo_root)?;
+    let mut config = config::load(options.config_path.as_deref(), repo_root)?;
     for warning in &config.warnings {
         eprintln!("warning: {warning}");
     }
@@ -94,21 +161,39 @@ pub(crate) fn run_with_interactor(
         println!("Loaded config from `{}`", path.display());
     }
 
-    if config.provider != Provider::Github {
-        bail!(
-            "Provider `{}` is configured, but `brel init` currently supports only `github`.",
-            config.provider
-        );
+    if options.yes && !config.provider.is_init_supported() {
+        bail_unsupported_init_provider(config.provider)?;
     }
 
     let repo_default_branch = workflow::detect_origin_default_branch(repo_root)?;
-    let selected_branch = resolve_default_branch(
-        &config.default_branch,
-        repo_default_branch.as_deref(),
-        options.yes,
-        interactor,
-    )?;
-    persist_selected_default_branch(repo_root, options, &config.source, &selected_branch)?;
+    if options.yes {
+        let selected_branch = resolve_default_branch(
+            &config.default_branch,
+            repo_default_branch.as_deref(),
+            options.yes,
+        )?;
+        config.default_branch = selected_branch.branch;
+        persist_init_values(
+            repo_root,
+            options,
+            &config.source,
+            &InitPersistenceValues::default_branch(&config.default_branch),
+        )?;
+    } else {
+        let selections =
+            prompt_init_selections(&config, repo_default_branch.as_deref(), interactor)?;
+        apply_init_selections(&mut config, &selections);
+        persist_init_values(
+            repo_root,
+            options,
+            &config.source,
+            &InitPersistenceValues::from_selections(&selections),
+        )?;
+    }
+
+    if !config.provider.is_init_supported() {
+        bail_unsupported_init_provider(config.provider)?;
+    }
 
     let workflow_path = workflow::resolve_workflow_path(&config.workflow_file)?;
     let workflow_absolute_path = repo_root.join(&workflow_path);
@@ -131,7 +216,7 @@ pub(crate) fn run_with_interactor(
         config.provider,
         WorkflowTemplate::ReleasePr,
         &WorkflowRenderContext {
-            default_branch: &selected_branch.branch,
+            default_branch: &config.default_branch,
             release_pr_command: &release_pr_command,
             next_version_command: &next_version_command,
             github_token_expr: "${{ github.token }}",
@@ -210,6 +295,138 @@ pub(crate) fn run_with_interactor(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct InitSelections {
+    provider: Provider,
+    default_branch: String,
+    changelog_enabled: bool,
+    changelog_provider: ChangelogProvider,
+    tagging_enabled: bool,
+    tag_template: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InitPersistenceValues<'a> {
+    provider: Option<Provider>,
+    default_branch: Option<&'a str>,
+    changelog_enabled: Option<bool>,
+    changelog_provider: Option<ChangelogProvider>,
+    tagging_enabled: Option<bool>,
+    tag_template: Option<&'a str>,
+}
+
+impl<'a> InitPersistenceValues<'a> {
+    fn default_branch(default_branch: &'a str) -> Self {
+        Self {
+            provider: None,
+            default_branch: Some(default_branch),
+            changelog_enabled: None,
+            changelog_provider: None,
+            tagging_enabled: None,
+            tag_template: None,
+        }
+    }
+
+    fn from_selections(selections: &'a InitSelections) -> Self {
+        Self {
+            provider: Some(selections.provider),
+            default_branch: Some(&selections.default_branch),
+            changelog_enabled: Some(selections.changelog_enabled),
+            changelog_provider: selections
+                .changelog_enabled
+                .then_some(selections.changelog_provider),
+            tagging_enabled: Some(selections.tagging_enabled),
+            tag_template: selections
+                .tagging_enabled
+                .then_some(selections.tag_template.as_str()),
+        }
+    }
+}
+
+fn prompt_init_selections(
+    config: &config::ResolvedConfig,
+    repo_default_branch: Option<&str>,
+    interactor: &mut dyn Interactor,
+) -> Result<InitSelections> {
+    let provider_choices = Provider::choices()
+        .iter()
+        .copied()
+        .filter(|choice| choice.init_supported)
+        .collect::<Vec<_>>();
+    let provider = interactor.choose_provider(config.provider, &provider_choices)?;
+    if !provider.is_init_supported() {
+        bail_unsupported_init_provider(provider)?;
+    }
+
+    let default_branch = default_branch_prompt_default(config, repo_default_branch);
+    let default_branch =
+        normalize_default_branch(&interactor.input_default_branch(&default_branch)?)?;
+
+    let changelog_enabled = interactor.confirm_changelog(config.release_pr.changelog.enabled)?;
+    let changelog_provider = if changelog_enabled {
+        interactor.choose_changelog_provider(config.release_pr.changelog.provider)?
+    } else {
+        config.release_pr.changelog.provider
+    };
+
+    let tagging_enabled = interactor.confirm_tagging(config.release_pr.tagging.enabled)?;
+    let tag_template = if tagging_enabled {
+        tag_template::normalize_tag_template(
+            &interactor.input_tag_template(&config.release_pr.tagging.tag_template)?,
+        )
+        .context("Invalid `release_pr.tagging.tag_template`.")?
+    } else {
+        config.release_pr.tagging.tag_template.clone()
+    };
+
+    Ok(InitSelections {
+        provider,
+        default_branch,
+        changelog_enabled,
+        changelog_provider,
+        tagging_enabled,
+        tag_template,
+    })
+}
+
+fn default_branch_prompt_default(
+    config: &config::ResolvedConfig,
+    repo_default_branch: Option<&str>,
+) -> String {
+    if matches!(config.source, ConfigSource::Defaulted) {
+        repo_default_branch
+            .unwrap_or(&config.default_branch)
+            .to_string()
+    } else {
+        config.default_branch.clone()
+    }
+}
+
+fn normalize_default_branch(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("Main branch cannot be empty.");
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn apply_init_selections(config: &mut config::ResolvedConfig, selections: &InitSelections) {
+    config.provider = selections.provider;
+    config.default_branch = selections.default_branch.clone();
+    config.release_pr.changelog.enabled = selections.changelog_enabled;
+    config.release_pr.changelog.provider = selections.changelog_provider;
+    config.release_pr.tagging.enabled = selections.tagging_enabled;
+    config.release_pr.tagging.tag_template = selections.tag_template.clone();
+}
+
+fn bail_unsupported_init_provider(provider: Provider) -> Result<()> {
+    bail!(
+        "Provider `{}` is configured, but `brel init` currently supports only `github`.",
+        provider
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FileAction {
     Create,
     Overwrite,
@@ -273,7 +490,6 @@ pub(crate) fn resolve_default_branch(
     configured_branch: &str,
     repo_default_branch: Option<&str>,
     yes: bool,
-    interactor: &mut dyn Interactor,
 ) -> Result<ResolvedDefaultBranch> {
     let Some(repo_branch) = repo_default_branch else {
         return Ok(ResolvedDefaultBranch {
@@ -295,26 +511,18 @@ pub(crate) fn resolve_default_branch(
         );
     }
 
-    let selected = interactor.choose_branch_for_mismatch(configured_branch, repo_branch)?;
-    if selected != configured_branch && selected != repo_branch {
-        bail!(
-            "Selected branch `{selected}` is invalid. \
-             Choose either `{configured_branch}` or `{repo_branch}`."
-        );
-    }
-
-    println!("Using branch `{selected}` for generated workflow triggers.");
-    Ok(ResolvedDefaultBranch { branch: selected })
+    Ok(ResolvedDefaultBranch {
+        branch: configured_branch.to_string(),
+    })
 }
 
-fn persist_selected_default_branch(
+fn persist_init_values(
     repo_root: &Path,
     options: &InitOptions,
     config_source: &ConfigSource,
-    selected_branch: &ResolvedDefaultBranch,
+    values: &InitPersistenceValues<'_>,
 ) -> Result<()> {
-    let Some(plan) = plan_config_persistence(repo_root, config_source, &selected_branch.branch)?
-    else {
+    let Some(plan) = plan_config_persistence(repo_root, config_source, values)? else {
         return Ok(());
     };
 
@@ -322,16 +530,10 @@ fn persist_selected_default_branch(
     if options.dry_run {
         match plan {
             ConfigPersistencePlan::Create(_) => {
-                println!(
-                    "Dry run: would create `{display_path}` with `default_branch = \"{}\"`",
-                    selected_branch.branch
-                );
+                println!("Dry run: would create `{display_path}` with init config selections");
             }
             ConfigPersistencePlan::Update(_) => {
-                println!(
-                    "Dry run: would update `{display_path}` to `default_branch = \"{}\"`",
-                    selected_branch.branch
-                );
+                println!("Dry run: would update `{display_path}` with init config selections");
             }
         }
         return Ok(());
@@ -339,20 +541,14 @@ fn persist_selected_default_branch(
 
     match plan {
         ConfigPersistencePlan::Create(path) => {
-            write_new_default_branch_config(&path, &selected_branch.branch)?;
+            write_new_init_config(&path, values)?;
             let display_path = display_repo_path(repo_root, &path);
-            println!(
-                "Created `{display_path}` with `default_branch = \"{}\"`.",
-                selected_branch.branch
-            );
+            println!("Created `{display_path}` with init config selections.");
         }
         ConfigPersistencePlan::Update(path) => {
-            update_default_branch_config(&path, &selected_branch.branch)?;
+            update_init_config(&path, values)?;
             let display_path = display_repo_path(repo_root, &path);
-            println!(
-                "Updated `{display_path}` with `default_branch = \"{}\"`.",
-                selected_branch.branch
-            );
+            println!("Updated `{display_path}` with init config selections.");
         }
     }
 
@@ -362,7 +558,7 @@ fn persist_selected_default_branch(
 fn plan_config_persistence(
     repo_root: &Path,
     config_source: &ConfigSource,
-    branch: &str,
+    values: &InitPersistenceValues<'_>,
 ) -> Result<Option<ConfigPersistencePlan>> {
     match config_source {
         ConfigSource::Defaulted => Ok(Some(ConfigPersistencePlan::Create(
@@ -377,11 +573,10 @@ fn plan_config_persistence(
                     path.display()
                 )
             })?;
-            let existing = document
-                .get("default_branch")
-                .and_then(|item| item.as_str());
+            let mut proposed = document.clone();
+            apply_init_values_to_document(&mut proposed, values);
 
-            if existing == Some(branch) {
+            if proposed.to_string() == current {
                 Ok(None)
             } else {
                 Ok(Some(ConfigPersistencePlan::Update(path.clone())))
@@ -390,14 +585,14 @@ fn plan_config_persistence(
     }
 }
 
-fn write_new_default_branch_config(path: &Path, branch: &str) -> Result<()> {
+fn write_new_init_config(path: &Path, values: &InitPersistenceValues<'_>) -> Result<()> {
     let mut document = DocumentMut::new();
-    document["default_branch"] = value(branch);
+    apply_init_values_to_document(&mut document, values);
     fs::write(path, document.to_string())
         .with_context(|| format!("Failed to write config file `{}`.", path.display()))
 }
 
-fn update_default_branch_config(path: &Path, branch: &str) -> Result<()> {
+fn update_init_config(path: &Path, values: &InitPersistenceValues<'_>) -> Result<()> {
     let current = fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file `{}`.", path.display()))?;
     let mut document = current.parse::<DocumentMut>().with_context(|| {
@@ -406,9 +601,35 @@ fn update_default_branch_config(path: &Path, branch: &str) -> Result<()> {
             path.display()
         )
     })?;
-    document["default_branch"] = value(branch);
+    apply_init_values_to_document(&mut document, values);
     fs::write(path, document.to_string())
         .with_context(|| format!("Failed to write config file `{}`.", path.display()))
+}
+
+fn apply_init_values_to_document(document: &mut DocumentMut, values: &InitPersistenceValues<'_>) {
+    if let Some(provider) = values.provider {
+        document["provider"] = value(provider.as_str());
+    }
+
+    if let Some(default_branch) = values.default_branch {
+        document["default_branch"] = value(default_branch);
+    }
+
+    if let Some(enabled) = values.changelog_enabled {
+        document["release_pr"]["changelog"]["enabled"] = value(enabled);
+    }
+
+    if let Some(provider) = values.changelog_provider {
+        document["release_pr"]["changelog"]["provider"] = value(provider.as_str());
+    }
+
+    if let Some(enabled) = values.tagging_enabled {
+        document["release_pr"]["tagging"]["enabled"] = value(enabled);
+    }
+
+    if let Some(tag_template) = values.tag_template {
+        document["release_pr"]["tagging"]["tag_template"] = value(tag_template);
+    }
 }
 
 fn display_repo_path(repo_root: &Path, path: &Path) -> String {
@@ -499,9 +720,20 @@ mod tests {
     #[derive(Default)]
     struct MockInteractor {
         overwrite_answer: bool,
-        selected_branch: RefCell<Option<String>>,
+        selected_provider: RefCell<Option<Provider>>,
+        default_branch_answer: RefCell<Option<String>>,
+        changelog_enabled_answer: RefCell<Option<bool>>,
+        changelog_provider_answer: RefCell<Option<ChangelogProvider>>,
+        tagging_enabled_answer: RefCell<Option<bool>>,
+        tag_template_answer: RefCell<Option<String>>,
+        provider_choices: RefCell<Vec<ProviderChoice>>,
         overwrite_calls: usize,
-        branch_select_calls: usize,
+        provider_select_calls: usize,
+        default_branch_input_calls: usize,
+        changelog_confirm_calls: usize,
+        changelog_provider_select_calls: usize,
+        tagging_confirm_calls: usize,
+        tag_template_input_calls: usize,
     }
 
     impl Interactor for MockInteractor {
@@ -510,17 +742,66 @@ mod tests {
             Ok(self.overwrite_answer)
         }
 
-        fn choose_branch_for_mismatch(
+        fn choose_provider(
             &mut self,
-            configured_branch: &str,
-            _repo_default_branch: &str,
-        ) -> Result<String> {
-            self.branch_select_calls += 1;
+            current_provider: Provider,
+            choices: &[ProviderChoice],
+        ) -> Result<Provider> {
+            self.provider_select_calls += 1;
+            self.provider_choices.replace(choices.to_vec());
+            let default_provider = choices
+                .iter()
+                .find(|choice| choice.provider == current_provider)
+                .or_else(|| choices.first())
+                .map(|choice| choice.provider)
+                .context("mock provider choices cannot be empty")?;
             Ok(self
-                .selected_branch
+                .selected_provider
+                .borrow()
+                .as_ref()
+                .copied()
+                .unwrap_or(default_provider))
+        }
+
+        fn input_default_branch(&mut self, default_branch: &str) -> Result<String> {
+            self.default_branch_input_calls += 1;
+            Ok(self
+                .default_branch_answer
                 .borrow()
                 .clone()
-                .unwrap_or_else(|| configured_branch.to_string()))
+                .unwrap_or_else(|| default_branch.to_string()))
+        }
+
+        fn confirm_changelog(&mut self, current: bool) -> Result<bool> {
+            self.changelog_confirm_calls += 1;
+            Ok((*self.changelog_enabled_answer.borrow()).unwrap_or(current))
+        }
+
+        fn choose_changelog_provider(
+            &mut self,
+            current_provider: ChangelogProvider,
+        ) -> Result<ChangelogProvider> {
+            self.changelog_provider_select_calls += 1;
+            Ok(self
+                .changelog_provider_answer
+                .borrow()
+                .as_ref()
+                .copied()
+                .unwrap_or(current_provider))
+        }
+
+        fn confirm_tagging(&mut self, current: bool) -> Result<bool> {
+            self.tagging_confirm_calls += 1;
+            Ok((*self.tagging_enabled_answer.borrow()).unwrap_or(current))
+        }
+
+        fn input_tag_template(&mut self, default_template: &str) -> Result<String> {
+            self.tag_template_input_calls += 1;
+            Ok(self
+                .tag_template_answer
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| default_template.to_string()))
         }
     }
 
@@ -556,6 +837,13 @@ mod tests {
             repo_root,
             &["symbolic-ref", "refs/remotes/origin/HEAD", &target],
         );
+    }
+
+    fn read_config_toml(path: &Path) -> toml::Value {
+        fs::read_to_string(path)
+            .unwrap()
+            .parse::<toml::Value>()
+            .unwrap()
     }
 
     #[test]
@@ -691,6 +979,169 @@ tag_template = "release-{version}-prod"
     }
 
     #[test]
+    fn interactive_init_can_disable_changelog() {
+        let temp_dir = tempdir().unwrap();
+        let mut interactor = MockInteractor {
+            changelog_enabled_answer: RefCell::new(Some(false)),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = read_config_toml(&temp_dir.path().join("brel.toml"));
+        assert_eq!(
+            config["release_pr"]["changelog"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(interactor.changelog_provider_select_calls, 0);
+
+        let workflow =
+            fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
+        assert!(!workflow.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!workflow.contains("uses: actions/setup-node@v6"));
+    }
+
+    #[test]
+    fn interactive_init_can_choose_changelogen() {
+        let temp_dir = tempdir().unwrap();
+        let mut interactor = MockInteractor {
+            changelog_provider_answer: RefCell::new(Some(ChangelogProvider::Changelogen)),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = read_config_toml(&temp_dir.path().join("brel.toml"));
+        assert_eq!(
+            config["release_pr"]["changelog"]["provider"].as_str(),
+            Some("changelogen")
+        );
+        assert_eq!(interactor.changelog_provider_select_calls, 1);
+
+        let workflow =
+            fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
+        assert!(workflow.contains("uses: actions/setup-node@v6"));
+        assert!(workflow.contains("changelogen@0.6.2"));
+        assert!(!workflow.contains("uses: orhun/git-cliff-action@v4"));
+    }
+
+    #[test]
+    fn interactive_init_can_enable_tagging_with_template() {
+        let temp_dir = tempdir().unwrap();
+        let mut interactor = MockInteractor {
+            tagging_enabled_answer: RefCell::new(Some(true)),
+            tag_template_answer: RefCell::new(Some("release-{{version}}".to_string())),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = read_config_toml(&temp_dir.path().join("brel.toml"));
+        assert_eq!(
+            config["release_pr"]["tagging"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["release_pr"]["tagging"]["tag_template"].as_str(),
+            Some("release-{version}")
+        );
+        assert_eq!(interactor.tag_template_input_calls, 1);
+
+        let workflow =
+            fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
+        assert!(workflow.contains("pull_request:"));
+        assert!(workflow.contains(
+            "args: --unreleased --tag release-${{ steps.next-version.outputs.version }}"
+        ));
+    }
+
+    #[test]
+    fn interactive_init_does_not_ask_tag_template_when_tagging_disabled() {
+        let temp_dir = tempdir().unwrap();
+        let mut interactor = MockInteractor {
+            tagging_enabled_answer: RefCell::new(Some(false)),
+            tag_template_answer: RefCell::new(Some("release-{version}".to_string())),
+            ..Default::default()
+        };
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = read_config_toml(&temp_dir.path().join("brel.toml"));
+        assert_eq!(
+            config["release_pr"]["tagging"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            config["release_pr"]["tagging"]
+                .as_table()
+                .unwrap()
+                .get("tag_template")
+                .is_none()
+        );
+        assert_eq!(interactor.tag_template_input_calls, 0);
+    }
+
+    #[test]
+    fn interactive_init_rewrites_unsupported_configured_provider_to_github() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(temp_dir.path().join("brel.toml"), "provider = \"gitlab\"\n").unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
+        assert!(config.contains("provider = \"github\""));
+        assert!(!config.contains("provider = \"gitlab\""));
+        assert_eq!(
+            interactor
+                .provider_choices
+                .borrow()
+                .iter()
+                .map(|choice| choice.provider)
+                .collect::<Vec<_>>(),
+            vec![Provider::Github]
+        );
+    }
+
+    #[test]
+    fn yes_init_rejects_unsupported_configured_provider() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(temp_dir.path().join("brel.toml"), "provider = \"gitlab\"\n").unwrap();
+        let mut interactor = MockInteractor::default();
+
+        let err = run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("currently supports only `github`"));
+        assert_eq!(interactor.provider_select_calls, 0);
+    }
+
+    #[test]
     fn managed_file_decline_keeps_existing_content() {
         let temp_dir = tempdir().unwrap();
         let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
@@ -785,7 +1236,7 @@ tag_template = "release-{version}-prod"
         let temp_dir = tempdir().unwrap();
         set_origin_head(temp_dir.path(), "develop");
         let mut interactor = MockInteractor {
-            selected_branch: RefCell::new(Some("develop".to_string())),
+            default_branch_answer: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
@@ -802,7 +1253,17 @@ tag_template = "release-{version}-prod"
         let workflow =
             fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
         assert!(workflow.contains("- develop"));
-        assert_eq!(interactor.branch_select_calls, 1);
+        assert_eq!(interactor.default_branch_input_calls, 1);
+        assert_eq!(interactor.provider_select_calls, 1);
+        assert_eq!(
+            interactor
+                .provider_choices
+                .borrow()
+                .iter()
+                .map(|choice| choice.provider)
+                .collect::<Vec<_>>(),
+            vec![Provider::Github]
+        );
     }
 
     #[test]
@@ -815,7 +1276,7 @@ tag_template = "release-{version}-prod"
         )
         .unwrap();
         let mut interactor = MockInteractor {
-            selected_branch: RefCell::new(Some("develop".to_string())),
+            default_branch_answer: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
@@ -846,7 +1307,7 @@ tag_template = "release-{version}-prod"
         )
         .unwrap();
         let mut interactor = MockInteractor {
-            selected_branch: RefCell::new(Some("develop".to_string())),
+            default_branch_answer: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
@@ -889,7 +1350,7 @@ tag_template = "release-{version}-prod"
         let original = "default_branch = \"main\"\n";
         fs::write(&config_path, original).unwrap();
         let mut interactor = MockInteractor {
-            selected_branch: RefCell::new(Some("develop".to_string())),
+            default_branch_answer: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
@@ -906,14 +1367,14 @@ tag_template = "release-{version}-prod"
     }
 
     #[test]
-    fn choosing_configured_branch_does_not_rewrite_config() {
+    fn interactive_init_persists_prompt_answers() {
         let temp_dir = tempdir().unwrap();
         set_origin_head(temp_dir.path(), "develop");
         let config_path = temp_dir.path().join("brel.toml");
         let original = "# keep me\ndefault_branch = \"main\"\n";
         fs::write(&config_path, original).unwrap();
         let mut interactor = MockInteractor {
-            selected_branch: RefCell::new(Some("main".to_string())),
+            default_branch_answer: RefCell::new(Some("main".to_string())),
             ..Default::default()
         };
 
@@ -924,33 +1385,49 @@ tag_template = "release-{version}-prod"
         )
         .unwrap();
 
-        let config = fs::read_to_string(&config_path).unwrap();
-        assert_eq!(config, original);
+        let config_content = fs::read_to_string(&config_path).unwrap();
+        assert!(config_content.contains("# keep me"));
+        let config = config_content.parse::<toml::Value>().unwrap();
+        assert_eq!(config["provider"].as_str(), Some("github"));
+        assert_eq!(config["default_branch"].as_str(), Some("main"));
+        assert_eq!(
+            config["release_pr"]["changelog"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["release_pr"]["changelog"]["provider"].as_str(),
+            Some("git-cliff")
+        );
+        assert_eq!(
+            config["release_pr"]["tagging"]["enabled"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
-    fn branch_mismatch_can_be_resolved_interactively() {
+    fn defaulted_config_prefers_detected_repo_branch_prompt_default() {
+        let temp_dir = tempdir().unwrap();
+        set_origin_head(temp_dir.path(), "develop");
         let mut interactor = MockInteractor {
-            selected_branch: RefCell::new(Some("main".to_string())),
+            default_branch_answer: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
-        let branch =
-            resolve_default_branch("develop", Some("main"), false, &mut interactor).unwrap();
-        assert_eq!(
-            branch,
-            ResolvedDefaultBranch {
-                branch: "main".to_string(),
-            }
-        );
-        assert_eq!(interactor.branch_select_calls, 1);
+        run_with_interactor(
+            temp_dir.path(),
+            &init_options(false, false),
+            &mut interactor,
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
+        assert!(config.contains("default_branch = \"develop\""));
+        assert_eq!(interactor.default_branch_input_calls, 1);
     }
 
     #[test]
     fn branch_mismatch_fails_with_yes() {
-        let mut interactor = MockInteractor::default();
-        let err =
-            resolve_default_branch("develop", Some("main"), true, &mut interactor).unwrap_err();
+        let err = resolve_default_branch("develop", Some("main"), true).unwrap_err();
         assert!(
             err.to_string()
                 .contains("does not match repository default branch")
