@@ -24,6 +24,11 @@ pub trait Interactor {
         current_provider: Provider,
         choices: &[ProviderChoice],
     ) -> Result<Provider>;
+    fn choose_branch_for_mismatch(
+        &mut self,
+        configured_branch: &str,
+        repo_default_branch: &str,
+    ) -> Result<String>;
     fn input_default_branch(&mut self, default_branch: &str) -> Result<String>;
     fn confirm_changelog(&mut self, current: bool) -> Result<bool>;
     fn choose_changelog_provider(
@@ -74,6 +79,31 @@ impl Interactor for CliInteractor {
             .context("Invalid forge selection.")
     }
 
+    fn choose_branch_for_mismatch(
+        &mut self,
+        configured_branch: &str,
+        repo_default_branch: &str,
+    ) -> Result<String> {
+        let options = [
+            format!("Keep config branch `{configured_branch}`"),
+            format!("Use repository default `{repo_default_branch}`"),
+        ];
+        let selection = Select::new()
+            .with_prompt(
+                "Config default_branch does not match repository default branch. Choose branch to use",
+            )
+            .items(&options)
+            .default(0)
+            .interact()
+            .context("Failed to read branch selection.")?;
+
+        match selection {
+            0 => Ok(configured_branch.to_string()),
+            1 => Ok(repo_default_branch.to_string()),
+            _ => bail!("Invalid branch selection."),
+        }
+    }
+
     fn input_default_branch(&mut self, default_branch: &str) -> Result<String> {
         Input::<String>::new()
             .with_prompt("Main branch")
@@ -94,14 +124,14 @@ impl Interactor for CliInteractor {
         &mut self,
         current_provider: ChangelogProvider,
     ) -> Result<ChangelogProvider> {
-        let choices = [ChangelogProvider::GitCliff, ChangelogProvider::Changelogen];
+        let choices = ChangelogProvider::choices();
         let options = choices
             .iter()
-            .map(|provider| provider.as_str())
+            .map(|choice| choice.provider.prompt_label())
             .collect::<Vec<_>>();
         let default = choices
             .iter()
-            .position(|provider| *provider == current_provider)
+            .position(|choice| choice.provider == current_provider)
             .unwrap_or(0);
         let selection = Select::new()
             .with_prompt("Changelog provider")
@@ -112,7 +142,7 @@ impl Interactor for CliInteractor {
 
         choices
             .get(selection)
-            .copied()
+            .map(|choice| choice.provider)
             .context("Invalid changelog provider selection.")
     }
 
@@ -167,11 +197,8 @@ pub(crate) fn run_with_interactor(
 
     let repo_default_branch = workflow::detect_origin_default_branch(repo_root)?;
     if options.yes {
-        let selected_branch = resolve_default_branch(
-            &config.default_branch,
-            repo_default_branch.as_deref(),
-            options.yes,
-        )?;
+        let selected_branch =
+            resolve_default_branch(&config.default_branch, repo_default_branch.as_deref())?;
         config.default_branch = selected_branch.branch;
         persist_init_values(
             repo_root,
@@ -189,10 +216,6 @@ pub(crate) fn run_with_interactor(
             &config.source,
             &InitPersistenceValues::from_selections(&selections),
         )?;
-    }
-
-    if !config.provider.is_init_supported() {
-        bail_unsupported_init_provider(config.provider)?;
     }
 
     let workflow_path = workflow::resolve_workflow_path(&config.workflow_file)?;
@@ -353,13 +376,9 @@ fn prompt_init_selections(
         .filter(|choice| choice.init_supported)
         .collect::<Vec<_>>();
     let provider = interactor.choose_provider(config.provider, &provider_choices)?;
-    if !provider.is_init_supported() {
-        bail_unsupported_init_provider(provider)?;
-    }
 
-    let default_branch = default_branch_prompt_default(config, repo_default_branch);
     let default_branch =
-        normalize_default_branch(&interactor.input_default_branch(&default_branch)?)?;
+        resolve_interactive_default_branch(config, repo_default_branch, interactor)?;
 
     let changelog_enabled = interactor.confirm_changelog(config.release_pr.changelog.enabled)?;
     let changelog_provider = if changelog_enabled {
@@ -388,16 +407,33 @@ fn prompt_init_selections(
     })
 }
 
-fn default_branch_prompt_default(
+fn resolve_interactive_default_branch(
     config: &config::ResolvedConfig,
     repo_default_branch: Option<&str>,
-) -> String {
-    if matches!(config.source, ConfigSource::Defaulted) {
-        repo_default_branch
-            .unwrap_or(&config.default_branch)
-            .to_string()
+    interactor: &mut dyn Interactor,
+) -> Result<String> {
+    if let Some(repo_branch) = repo_default_branch
+        && repo_branch != config.default_branch
+        && !matches!(config.source, ConfigSource::Defaulted)
+    {
+        let selected =
+            interactor.choose_branch_for_mismatch(&config.default_branch, repo_branch)?;
+        if selected != config.default_branch && selected != repo_branch {
+            bail!(
+                "Selected branch `{selected}` is invalid. \
+                 Choose either `{}` or `{repo_branch}`.",
+                config.default_branch
+            );
+        }
+
+        Ok(selected)
     } else {
-        config.default_branch.clone()
+        let default_branch = if matches!(config.source, ConfigSource::Defaulted) {
+            repo_default_branch.unwrap_or(&config.default_branch)
+        } else {
+            &config.default_branch
+        };
+        normalize_default_branch(&interactor.input_default_branch(default_branch)?)
     }
 }
 
@@ -489,7 +525,6 @@ fn plan_file_action(
 pub(crate) fn resolve_default_branch(
     configured_branch: &str,
     repo_default_branch: Option<&str>,
-    yes: bool,
 ) -> Result<ResolvedDefaultBranch> {
     let Some(repo_branch) = repo_default_branch else {
         return Ok(ResolvedDefaultBranch {
@@ -503,17 +538,11 @@ pub(crate) fn resolve_default_branch(
         });
     }
 
-    if yes {
-        bail!(
-            "Configured default_branch `{configured_branch}` does not match repository default \
-             branch `{repo_branch}` (origin/HEAD). Update config or rerun without --yes \
-             to choose interactively."
-        );
-    }
-
-    Ok(ResolvedDefaultBranch {
-        branch: configured_branch.to_string(),
-    })
+    bail!(
+        "Configured default_branch `{configured_branch}` does not match repository default \
+         branch `{repo_branch}` (origin/HEAD). Update config or rerun without --yes \
+         to choose interactively."
+    );
 }
 
 fn persist_init_values(
@@ -721,6 +750,7 @@ mod tests {
     struct MockInteractor {
         overwrite_answer: bool,
         selected_provider: RefCell<Option<Provider>>,
+        selected_branch_for_mismatch: RefCell<Option<String>>,
         default_branch_answer: RefCell<Option<String>>,
         changelog_enabled_answer: RefCell<Option<bool>>,
         changelog_provider_answer: RefCell<Option<ChangelogProvider>>,
@@ -729,6 +759,7 @@ mod tests {
         provider_choices: RefCell<Vec<ProviderChoice>>,
         overwrite_calls: usize,
         provider_select_calls: usize,
+        branch_mismatch_select_calls: usize,
         default_branch_input_calls: usize,
         changelog_confirm_calls: usize,
         changelog_provider_select_calls: usize,
@@ -761,6 +792,19 @@ mod tests {
                 .as_ref()
                 .copied()
                 .unwrap_or(default_provider))
+        }
+
+        fn choose_branch_for_mismatch(
+            &mut self,
+            configured_branch: &str,
+            _repo_default_branch: &str,
+        ) -> Result<String> {
+            self.branch_mismatch_select_calls += 1;
+            Ok(self
+                .selected_branch_for_mismatch
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| configured_branch.to_string()))
         }
 
         fn input_default_branch(&mut self, default_branch: &str) -> Result<String> {
@@ -1254,6 +1298,7 @@ tag_template = "release-{version}-prod"
             fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
         assert!(workflow.contains("- develop"));
         assert_eq!(interactor.default_branch_input_calls, 1);
+        assert_eq!(interactor.branch_mismatch_select_calls, 0);
         assert_eq!(interactor.provider_select_calls, 1);
         assert_eq!(
             interactor
@@ -1276,7 +1321,7 @@ tag_template = "release-{version}-prod"
         )
         .unwrap();
         let mut interactor = MockInteractor {
-            default_branch_answer: RefCell::new(Some("develop".to_string())),
+            selected_branch_for_mismatch: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
@@ -1294,6 +1339,8 @@ tag_template = "release-{version}-prod"
         assert!(config.contains("[release_pr.changelog]"));
         assert!(config.contains("enabled = false"));
         assert!(!config.contains("default_branch = \"main\""));
+        assert_eq!(interactor.branch_mismatch_select_calls, 1);
+        assert_eq!(interactor.default_branch_input_calls, 0);
     }
 
     #[test]
@@ -1307,7 +1354,7 @@ tag_template = "release-{version}-prod"
         )
         .unwrap();
         let mut interactor = MockInteractor {
-            default_branch_answer: RefCell::new(Some("develop".to_string())),
+            selected_branch_for_mismatch: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
@@ -1322,6 +1369,8 @@ tag_template = "release-{version}-prod"
         assert!(config.contains("workflow_file = \"custom.yml\""));
         assert!(config.contains("default_branch = \"develop\""));
         assert!(!config.contains("default_branch = \"main\""));
+        assert_eq!(interactor.branch_mismatch_select_calls, 1);
+        assert_eq!(interactor.default_branch_input_calls, 0);
     }
 
     #[test]
@@ -1350,7 +1399,7 @@ tag_template = "release-{version}-prod"
         let original = "default_branch = \"main\"\n";
         fs::write(&config_path, original).unwrap();
         let mut interactor = MockInteractor {
-            default_branch_answer: RefCell::new(Some("develop".to_string())),
+            selected_branch_for_mismatch: RefCell::new(Some("develop".to_string())),
             ..Default::default()
         };
 
@@ -1364,6 +1413,8 @@ tag_template = "release-{version}-prod"
                 .join(".github/workflows/release-pr.yml")
                 .exists()
         );
+        assert_eq!(interactor.branch_mismatch_select_calls, 1);
+        assert_eq!(interactor.default_branch_input_calls, 0);
     }
 
     #[test]
@@ -1373,10 +1424,7 @@ tag_template = "release-{version}-prod"
         let config_path = temp_dir.path().join("brel.toml");
         let original = "# keep me\ndefault_branch = \"main\"\n";
         fs::write(&config_path, original).unwrap();
-        let mut interactor = MockInteractor {
-            default_branch_answer: RefCell::new(Some("main".to_string())),
-            ..Default::default()
-        };
+        let mut interactor = MockInteractor::default();
 
         run_with_interactor(
             temp_dir.path(),
@@ -1402,6 +1450,8 @@ tag_template = "release-{version}-prod"
             config["release_pr"]["tagging"]["enabled"].as_bool(),
             Some(false)
         );
+        assert_eq!(interactor.branch_mismatch_select_calls, 1);
+        assert_eq!(interactor.default_branch_input_calls, 0);
     }
 
     #[test]
@@ -1423,11 +1473,12 @@ tag_template = "release-{version}-prod"
         let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
         assert!(config.contains("default_branch = \"develop\""));
         assert_eq!(interactor.default_branch_input_calls, 1);
+        assert_eq!(interactor.branch_mismatch_select_calls, 0);
     }
 
     #[test]
     fn branch_mismatch_fails_with_yes() {
-        let err = resolve_default_branch("develop", Some("main"), true).unwrap_err();
+        let err = resolve_default_branch("develop", Some("main")).unwrap_err();
         assert!(
             err.to_string()
                 .contains("does not match repository default branch")

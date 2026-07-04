@@ -107,12 +107,44 @@ pub enum ChangelogProvider {
     Changelogen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangelogProviderChoice {
+    pub provider: ChangelogProvider,
+    pub config_value: &'static str,
+    pub prompt_label: &'static str,
+}
+
+const CHANGELOG_PROVIDER_CHOICES: &[ChangelogProviderChoice] = &[
+    ChangelogProviderChoice {
+        provider: ChangelogProvider::GitCliff,
+        config_value: "git-cliff",
+        prompt_label: "git-cliff",
+    },
+    ChangelogProviderChoice {
+        provider: ChangelogProvider::Changelogen,
+        config_value: "changelogen",
+        prompt_label: "changelogen",
+    },
+];
+
 impl ChangelogProvider {
+    pub fn choices() -> &'static [ChangelogProviderChoice] {
+        CHANGELOG_PROVIDER_CHOICES
+    }
+
+    pub fn choice(self) -> &'static ChangelogProviderChoice {
+        Self::choices()
+            .iter()
+            .find(|choice| choice.provider == self)
+            .expect("every ChangelogProvider variant must have metadata")
+    }
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::GitCliff => "git-cliff",
-            Self::Changelogen => "changelogen",
-        }
+        self.choice().config_value
+    }
+
+    pub fn prompt_label(self) -> &'static str {
+        self.choice().prompt_label
     }
 }
 
@@ -126,12 +158,21 @@ impl FromStr for ChangelogProvider {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "git-cliff" => Ok(Self::GitCliff),
-            "changelogen" => Ok(Self::Changelogen),
-            other => bail!(
-                "Unsupported `release_pr.changelog.provider` value `{other}`. Expected `git-cliff` or `changelogen`."
-            ),
+        let normalized = value.trim().to_ascii_lowercase();
+        if let Some(choice) = Self::choices()
+            .iter()
+            .find(|choice| choice.config_value == normalized)
+        {
+            Ok(choice.provider)
+        } else {
+            let expected = Self::choices()
+                .iter()
+                .map(|choice| format!("`{}`", choice.config_value))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            bail!(
+                "Unsupported `release_pr.changelog.provider` value `{normalized}`. Expected {expected}."
+            )
         }
     }
 }
@@ -769,6 +810,31 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(init_supported, vec![Provider::Github]);
+    }
+
+    #[test]
+    fn changelog_provider_metadata_is_the_source_of_truth() {
+        let choices = ChangelogProvider::choices();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| (choice.provider, choice.config_value, choice.prompt_label))
+                .collect::<Vec<_>>(),
+            vec![
+                (ChangelogProvider::GitCliff, "git-cliff", "git-cliff"),
+                (ChangelogProvider::Changelogen, "changelogen", "changelogen"),
+            ]
+        );
+
+        for choice in choices {
+            assert_eq!(choice.provider.as_str(), choice.config_value);
+            assert_eq!(choice.provider.prompt_label(), choice.prompt_label);
+            assert_eq!(
+                ChangelogProvider::from_str(choice.config_value).unwrap(),
+                choice.provider
+            );
+        }
     }
 
     #[test]

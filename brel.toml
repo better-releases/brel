@@ -1,3 +1,8 @@
+provider = "github"
+default_branch = "main"
+
+[release_pr]
+changelog = { enabled = false }
 [release_pr.format_overrides]
 "Cargo.lock" = "toml"
 
@@ -6,5 +11,5 @@
 "Cargo.lock" = ["package[name=brel].version"]
 
 [release_pr.tagging]
-enabled = true
+enabled = false
 tag_template = "{version}"
