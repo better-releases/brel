@@ -240,7 +240,8 @@ enabled = false
 For PRs:
 
 - `brel` uses `gh pr list` to find an open managed release PR.
-- If found, it updates that PR (continuity wins over recomputing branch name).
+- If found on the current rendered release branch, it updates that PR.
+- If found on a stale release branch, it creates or updates the current rendered-branch PR first, closes the stale PR, and best-effort deletes the stale remote branch.
 - If not found, it creates a new PR.
 
 ## Tagging on Merge

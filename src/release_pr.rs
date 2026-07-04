@@ -60,16 +60,19 @@ pub(crate) fn run_with_runner(
 
     let gh_token = resolve_gh_token(gh_token_override)?;
     let gh_env = vec![("GH_TOKEN".to_string(), gh_token)];
-    let managed_pr = find_managed_open_pr(runner, repo_root, &config, &gh_env)?;
-    let release_branch = managed_pr
-        .as_ref()
-        .map(|pr| pr.head_ref_name.clone())
-        .unwrap_or_else(|| {
-            render_release_branch(
-                &config.release_pr.release_branch_pattern,
-                &next_version_string,
-            )
-        });
+    let managed_prs = find_managed_open_prs(runner, repo_root, &config, &gh_env)?;
+    let release_branch = render_release_branch(
+        &config.release_pr.release_branch_pattern,
+        &next_version_string,
+    );
+    let current_pr = managed_prs
+        .iter()
+        .find(|pr| pr.head_ref_name == release_branch)
+        .cloned();
+    let stale_prs = managed_prs
+        .into_iter()
+        .filter(|pr| pr.head_ref_name != release_branch)
+        .collect::<Vec<_>>();
 
     git_checkout_branch(runner, repo_root, &release_branch)?;
     let mut files_to_stage = update_report.changed_files.clone();
@@ -105,7 +108,7 @@ pub(crate) fn run_with_runner(
         template_override.as_deref(),
     )?;
 
-    match managed_pr {
+    match current_pr {
         Some(pr) => gh_edit_pr(
             runner,
             repo_root,
@@ -124,6 +127,24 @@ pub(crate) fn run_with_runner(
             &pr_body,
             &gh_env,
         )?,
+    }
+
+    let mut stale_close_failures = Vec::new();
+    for pr in stale_prs {
+        if let Err(err) = close_stale_release_pr(runner, repo_root, &pr, &release_branch, &gh_env) {
+            eprintln!(
+                "warning: failed to close stale release PR #{} (`{}`): {err:#}",
+                pr.number, pr.head_ref_name
+            );
+            stale_close_failures.push(format!("#{} (`{}`): {err:#}", pr.number, pr.head_ref_name));
+        }
+    }
+    if !stale_close_failures.is_empty() {
+        bail!(
+            "Failed to close {} stale release pull request(s): {}",
+            stale_close_failures.len(),
+            stale_close_failures.join("; ")
+        );
     }
 
     println!("Release PR prepared for tag {next_tag}.");
@@ -437,12 +458,12 @@ struct GhPullRequest {
     body: Option<String>,
 }
 
-fn find_managed_open_pr(
+fn find_managed_open_prs(
     runner: &mut dyn CommandRunner,
     repo_root: &Path,
     config: &ResolvedConfig,
     gh_env: &[(String, String)],
-) -> Result<Option<GhPullRequest>> {
+) -> Result<Vec<GhPullRequest>> {
     let output = run_checked(
         runner,
         repo_root,
@@ -463,11 +484,14 @@ fn find_managed_open_pr(
 
     let prs: Vec<GhPullRequest> = serde_json::from_str(&output.stdout)
         .context("Failed to parse `gh pr list` JSON output.")?;
-    Ok(prs.into_iter().find(|pr| {
-        pr.body
-            .as_deref()
-            .is_some_and(|body| body.contains(MANAGED_RELEASE_PR_MARKER))
-    }))
+    Ok(prs
+        .into_iter()
+        .filter(|pr| {
+            pr.body
+                .as_deref()
+                .is_some_and(|body| body.contains(MANAGED_RELEASE_PR_MARKER))
+        })
+        .collect())
 }
 
 fn git_checkout_branch(
@@ -652,6 +676,77 @@ fn gh_edit_pr(
     Ok(())
 }
 
+fn close_stale_release_pr(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    pr: &GhPullRequest,
+    release_branch: &str,
+    gh_env: &[(String, String)],
+) -> Result<()> {
+    let close_comment = format!(
+        "Closing this managed release PR because the next release version changed and the release branch is now `{release_branch}`."
+    );
+    gh_close_pr(runner, repo_root, pr.number, &close_comment, gh_env)?;
+    git_delete_remote_branch_best_effort(runner, repo_root, &pr.head_ref_name);
+    Ok(())
+}
+
+fn gh_close_pr(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    number: u64,
+    comment: &str,
+    gh_env: &[(String, String)],
+) -> Result<()> {
+    run_checked(
+        runner,
+        repo_root,
+        "gh",
+        vec![
+            "pr".to_string(),
+            "close".to_string(),
+            number.to_string(),
+            "--comment".to_string(),
+            comment.to_string(),
+        ],
+        gh_env,
+        "Failed to close stale release pull request.",
+    )?;
+    Ok(())
+}
+
+fn git_delete_remote_branch_best_effort(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    branch: &str,
+) {
+    let args = vec![
+        "push".to_string(),
+        "origin".to_string(),
+        "--delete".to_string(),
+        branch.to_string(),
+    ];
+    match runner.run(repo_root, "git", &args, &[]) {
+        Ok(output) if output.status == 0 => {}
+        Ok(output) => {
+            let stderr = output.stderr.trim();
+            let details = if stderr.is_empty() {
+                "no stderr output"
+            } else {
+                stderr
+            };
+            eprintln!(
+                "warning: failed to delete stale release branch `{branch}` from origin: {details}"
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: failed to delete stale release branch `{branch}` from origin: {err:#}"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
     pub status: i32,
@@ -801,6 +896,32 @@ mod tests {
         format!("{sha}\u{1f}{subject}\u{1f}{body}\u{1e}")
     }
 
+    fn args_start_with(args: &[String], expected: &[&str]) -> bool {
+        args.len() >= expected.len()
+            && args
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.as_str() == *expected)
+    }
+
+    fn args_equal(args: &[String], expected: &[&str]) -> bool {
+        args.len() == expected.len()
+            && args
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.as_str() == *expected)
+    }
+
+    fn call_position(
+        calls: &[RecordedCall],
+        predicate: impl FnMut(&RecordedCall) -> bool,
+    ) -> usize {
+        calls
+            .iter()
+            .position(predicate)
+            .expect("expected recorded command call")
+    }
+
     #[test]
     fn parse_release_tag_supports_only_configured_template() {
         let template = TagTemplate::parse("release-{version}").unwrap();
@@ -913,7 +1034,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"headRefName":"brel/release/v1.2.3","body":"{}\nold body"}}]"#,
+            r#"[{{"number":7,"headRefName":"brel/release/v1.3.0","body":"{}\nold body"}}]"#,
             MANAGED_RELEASE_PR_MARKER
         );
         let mut runner = ScriptedRunner::new(vec![
@@ -935,13 +1056,342 @@ default_branch = "main"
                 == vec![
                     "checkout".to_string(),
                     "-B".to_string(),
-                    "brel/release/v1.2.3".to_string()
+                    "brel/release/v1.3.0".to_string()
                 ]));
         assert!(runner.calls.iter().any(|call| {
             call.program == "gh"
                 && call
                     .args
                     .starts_with(&["pr".to_string(), "edit".to_string(), "7".to_string()])
+        }));
+    }
+
+    #[test]
+    fn stale_release_pr_branch_is_recreated() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_pr_json = format!(
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nold body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(&existing_pr_json),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+
+        assert!(runner.calls.iter().any(|call| call.program == "git"
+            && call.args
+                == vec![
+                    "checkout".to_string(),
+                    "-B".to_string(),
+                    "brel/release/v1.3.0".to_string()
+                ]));
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && call
+                    .args
+                    .starts_with(&["push".to_string(), "--force-with-lease".to_string()])
+                && call.args.contains(&"brel/release/v1.3.0".to_string())
+        }));
+        let create_idx = call_position(&runner.calls, |call| {
+            call.program == "gh"
+                && args_start_with(&call.args, &["pr", "create"])
+                && call.args.contains(&"--head".to_string())
+                && call.args.contains(&"brel/release/v1.3.0".to_string())
+        });
+        let close_idx = call_position(&runner.calls, |call| {
+            call.program == "gh" && args_start_with(&call.args, &["pr", "close", "7"])
+        });
+        let delete_idx = call_position(&runner.calls, |call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.4"],
+                )
+        });
+        assert!(create_idx < close_idx);
+        assert!(close_idx < delete_idx);
+        assert!(
+            runner.calls[close_idx]
+                .args
+                .iter()
+                .any(|arg| arg == "--comment")
+        );
+        assert!(
+            !runner.calls[close_idx]
+                .args
+                .iter()
+                .any(|arg| arg == "--delete-branch")
+        );
+        assert!(!runner.calls.iter().any(|call| {
+            call.program == "gh"
+                && call
+                    .args
+                    .starts_with(&["pr".to_string(), "edit".to_string(), "7".to_string()])
+        }));
+    }
+
+    #[test]
+    fn stale_release_pr_is_not_closed_when_replacement_create_fails() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_pr_json = format!(
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nold body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(&existing_pr_json),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            err_status(1, "create failed"),
+        ]);
+
+        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("Failed to create release pull request."));
+        assert!(
+            runner
+                .calls
+                .iter()
+                .any(|call| call.program == "gh" && args_start_with(&call.args, &["pr", "create"]))
+        );
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.program == "gh" && args_start_with(&call.args, &["pr", "close"]))
+        );
+        assert!(!runner.calls.iter().any(|call| {
+            call.program == "git" && args_start_with(&call.args, &["push", "origin", "--delete"])
+        }));
+    }
+
+    #[test]
+    fn stale_release_pr_branch_delete_failure_is_tolerated() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_pr_json = format!(
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nold body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(&existing_pr_json),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+            ok(""),
+            err_status(1, "remote ref does not exist"),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+
+        assert!(
+            runner
+                .calls
+                .iter()
+                .any(|call| call.program == "gh" && args_start_with(&call.args, &["pr", "close"]))
+        );
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.4"],
+                )
+        }));
+    }
+
+    #[test]
+    fn stale_release_pr_close_failure_does_not_skip_remaining_stale_prs() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_pr_json = format!(
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nstale body"}},{{"number":8,"headRefName":"brel/release/v1.2.5","body":"{}\nnewer stale body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER, MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(&existing_pr_json),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+            err_status(1, "close failed"),
+            ok(""),
+            ok(""),
+        ]);
+
+        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("Failed to close 1 stale release pull request"));
+        assert!(err_text.contains("brel/release/v1.2.4"));
+
+        let first_close_idx = call_position(&runner.calls, |call| {
+            call.program == "gh" && args_start_with(&call.args, &["pr", "close", "7"])
+        });
+        let second_close_idx = call_position(&runner.calls, |call| {
+            call.program == "gh" && args_start_with(&call.args, &["pr", "close", "8"])
+        });
+        let second_delete_idx = call_position(&runner.calls, |call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.5"],
+                )
+        });
+
+        assert!(first_close_idx < second_close_idx);
+        assert!(second_close_idx < second_delete_idx);
+        assert!(!runner.calls.iter().any(|call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.4"],
+                )
+        }));
+    }
+
+    #[test]
+    fn current_release_pr_is_updated_when_stale_managed_pr_appears_first() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_pr_json = format!(
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nstale body"}},{{"number":8,"headRefName":"brel/release/v1.3.0","body":"{}\ncurrent body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER, MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(&existing_pr_json),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+
+        let edit_idx = call_position(&runner.calls, |call| {
+            call.program == "gh" && args_start_with(&call.args, &["pr", "edit", "8"])
+        });
+        let close_idx = call_position(&runner.calls, |call| {
+            call.program == "gh" && args_start_with(&call.args, &["pr", "close", "7"])
+        });
+        assert!(edit_idx < close_idx);
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.program == "gh" && args_start_with(&call.args, &["pr", "create"]))
+        );
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.4"],
+                )
         }));
     }
 
