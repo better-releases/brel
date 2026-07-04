@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::path::Path;
 use std::process::Command as ProcessCommand;
 use tempfile::tempdir;
 
@@ -122,6 +123,121 @@ tag_template = "release-{version}"
         .assert()
         .success()
         .stdout(predicate::eq("0.1.0\n"));
+}
+
+#[test]
+fn changelog_disabled_exits_successfully() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.changelog]
+enabled = false
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("changelog")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Changelog generation is disabled. Skipping changelog.",
+        ));
+}
+
+#[test]
+fn changelog_no_releasable_commits_exits_successfully() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("changelog")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No releasable commits found. Skipping changelog.",
+        ));
+}
+
+#[test]
+fn changelog_git_cliff_provider_runs_expected_command() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat: add feature"]);
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_command(
+        &bin_dir.join("git-cliff"),
+        r#"printf '%s\n' "$@" > "$BREL_FAKE_ARGS""#,
+    );
+    let args_file = temp_dir.path().join("git-cliff.args");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("changelog")
+        .env("PATH", prepend_path(&bin_dir))
+        .env("BREL_FAKE_ARGS", &args_file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Generated changelog for tag v0.1.0.",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(args_file).unwrap(),
+        "--config\ncliff.toml\n--unreleased\n--tag\nv0.1.0\n--prepend\nCHANGELOG.md\n"
+    );
+}
+
+#[test]
+fn changelog_changelogen_provider_runs_expected_command() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.changelog]
+provider = "changelogen"
+output_file = "docs/changelog.md"
+
+[release_pr.changelog.changelogen]
+version = "0.5.0"
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat: add feature"]);
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_command(
+        &bin_dir.join("npx"),
+        r#"printf '%s\n' "$@" > "$BREL_FAKE_ARGS""#,
+    );
+    let args_file = temp_dir.path().join("npx.args");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("changelog")
+        .env("PATH", prepend_path(&bin_dir))
+        .env("BREL_FAKE_ARGS", &args_file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Generated changelog for tag v0.1.0.",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(args_file).unwrap(),
+        "--yes\nchangelogen@0.5.0\n--to\nHEAD\n-r\n0.1.0\n--output\ndocs/changelog.md\n"
+    );
 }
 
 #[test]
@@ -247,19 +363,16 @@ fn init_without_config_creates_default_workflow() {
     assert!(content.contains("fetch-depth: 0"));
     assert!(content.contains("uses: better-releases/setup-brel@v1"));
     assert!(!content.contains("BREL_RELEASE_REPO"));
-    assert!(content.contains("id: next-version"));
-    assert!(content.contains("next_version=\"$(brel next-version)\""));
     assert!(content.contains("GH_TOKEN: ${{ github.token }}"));
-    assert!(content.contains("if: ${{ steps.next-version.outputs.version != '' }}"));
-    assert!(
-        content.contains("args: --unreleased --tag v${{ steps.next-version.outputs.version }}")
-    );
-    assert!(content.contains("--prepend CHANGELOG.md"));
-    assert!(!content.contains("--output CHANGELOG.md"));
-    assert!(content.contains("uses: orhun/git-cliff-action@v4"));
+    assert!(content.contains("run: brel changelog"));
+    assert!(content.contains("run: brel release-pr"));
+    assert!(!content.contains("id: next-version"));
+    assert!(!content.contains("next_version=\"$(brel next-version)\""));
+    assert!(!content.contains("args: --unreleased"));
+    assert!(content.contains("uses: taiki-e/install-action@git-cliff"));
+    assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
     assert!(!content.contains("uses: actions/setup-node@v6"));
     assert!(!content.contains("changelogen@"));
-    assert!(content.contains("run: brel release-pr"));
     assert!(!content.contains("pull_request:"));
 }
 
@@ -284,8 +397,10 @@ enabled = false
     let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
     let content = fs::read_to_string(workflow).unwrap();
     assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+    assert!(!content.contains("uses: taiki-e/install-action@git-cliff"));
     assert!(!content.contains("uses: actions/setup-node@v6"));
     assert!(!content.contains("changelogen@"));
+    assert!(!content.contains("run: brel changelog"));
 }
 
 #[test]
@@ -315,10 +430,10 @@ version = "0.5.0"
     assert!(content.contains("uses: actions/setup-node@v6"));
     assert!(content.contains("node-version: 24"));
     assert!(content.contains("package-manager-cache: false"));
-    assert!(content.contains(
-        "run: npx --yes 'changelogen@0.5.0' --to HEAD -r \"${{ steps.next-version.outputs.version }}\" --output docs/changelog.md"
-    ));
+    assert!(content.contains("run: brel changelog"));
     assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+    assert!(!content.contains("uses: taiki-e/install-action@git-cliff"));
+    assert!(!content.contains("changelogen@0.5.0"));
     assert!(!content.contains("--bump"));
     assert!(!content.contains("--release"));
     assert!(!content.contains("--commit"));
@@ -352,6 +467,34 @@ enabled = true
     assert!(content.contains("pull_request:"));
     assert!(content.contains("- closed"));
     assert!(content.contains("Create release tag"));
+    assert!(content.contains("run: brel tag"));
+    assert!(!content.contains("jq -r"));
+    assert!(!content.contains("sed -nE"));
+}
+
+#[test]
+fn init_with_custom_config_forwards_config_to_workflow_commands() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("release.toml"),
+        r#"
+[release_pr.tagging]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes", "--config", "release.toml"])
+        .assert()
+        .success();
+
+    let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+    let content = fs::read_to_string(workflow).unwrap();
+    assert!(content.contains("run: brel changelog --config release.toml"));
+    assert!(content.contains("run: brel release-pr --config release.toml"));
+    assert!(content.contains("run: brel tag --config release.toml"));
 }
 
 #[test]
@@ -409,9 +552,9 @@ tag_template = "{version}"
 
     let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
     let content = fs::read_to_string(workflow).unwrap();
-    assert!(content.contains("args: --unreleased --tag ${{ steps.next-version.outputs.version }}"));
-    assert!(content.contains("--prepend CHANGELOG.md"));
-    assert!(!content.contains("--output CHANGELOG.md"));
+    assert!(content.contains("run: brel changelog"));
+    assert!(!content.contains("args: --unreleased"));
+    assert!(!content.contains("--prepend CHANGELOG.md"));
 }
 
 #[test]
@@ -455,3 +598,29 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn prepend_path(bin_dir: &Path) -> String {
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&current_path));
+    std::env::join_paths(paths)
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+}
+
+fn write_fake_command(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    make_executable(path);
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}

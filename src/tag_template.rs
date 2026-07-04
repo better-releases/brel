@@ -27,14 +27,6 @@ impl TagTemplate {
         })
     }
 
-    pub fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    pub fn suffix(&self) -> &str {
-        &self.suffix
-    }
-
     pub fn render(&self, version: &str) -> String {
         format!("{}{}{}", self.prefix, version, self.suffix)
     }

@@ -1,5 +1,5 @@
-use crate::cli::{NextVersionArgs, ReleasePrArgs};
-use crate::config::{self, Provider, ReleasePrConfig, ResolvedConfig};
+use crate::cli::{ChangelogArgs, NextVersionArgs, ReleasePrArgs, TagArgs};
+use crate::config::{self, ChangelogProvider, Provider, ReleasePrConfig, ResolvedConfig};
 use crate::tag_template::TagTemplate;
 use crate::template::{
     self, MANAGED_RELEASE_PR_MARKER, ReleasePrBodyContext, ReleasePrCommitContext,
@@ -18,6 +18,25 @@ pub fn run(args: ReleasePrArgs) -> Result<()> {
     run_with_runner(&repo_root, args.config.as_deref(), &mut runner, None)
 }
 
+pub fn run_changelog(args: ChangelogArgs) -> Result<()> {
+    let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
+    let mut runner = ProcessRunner;
+    run_changelog_with_runner(&repo_root, args.config.as_deref(), &mut runner)
+}
+
+pub fn run_tag(args: TagArgs) -> Result<()> {
+    let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
+    let mut runner = ProcessRunner;
+    run_tag_with_runner(
+        &repo_root,
+        args.config.as_deref(),
+        args.tag.as_deref(),
+        args.target.as_deref(),
+        &mut runner,
+        None,
+    )
+}
+
 pub fn run_next_version(args: NextVersionArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
@@ -30,7 +49,7 @@ pub(crate) fn run_with_runner(
     runner: &mut dyn CommandRunner,
     gh_token_override: Option<&str>,
 ) -> Result<()> {
-    let config = load_supported_config(config_path, repo_root, "release-pr")?;
+    let config = load_github_config(config_path, repo_root, "release-pr")?;
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
 
@@ -60,7 +79,8 @@ pub(crate) fn run_with_runner(
 
     let gh_token = resolve_gh_token(gh_token_override)?;
     let gh_env = vec![("GH_TOKEN".to_string(), gh_token)];
-    let managed_prs = find_managed_open_prs(runner, repo_root, &config, &gh_env)?;
+    let managed_prs =
+        GithubProvider::new(runner, repo_root, &gh_env).find_managed_open_prs(&config)?;
     let release_branch = render_release_branch(
         &config.release_pr.release_branch_pattern,
         &next_version_string,
@@ -108,35 +128,25 @@ pub(crate) fn run_with_runner(
         template_override.as_deref(),
     )?;
 
-    match current_pr {
-        Some(pr) => gh_edit_pr(
-            runner,
-            repo_root,
-            pr.number,
-            &config.default_branch,
-            &pr_title,
-            &pr_body,
-            &gh_env,
-        )?,
-        None => gh_create_pr(
-            runner,
-            repo_root,
-            &config.default_branch,
-            &release_branch,
-            &pr_title,
-            &pr_body,
-            &gh_env,
-        )?,
-    }
-
     let mut stale_close_failures = Vec::new();
-    for pr in stale_prs {
-        if let Err(err) = close_stale_release_pr(runner, repo_root, &pr, &release_branch, &gh_env) {
-            eprintln!(
-                "warning: failed to close stale release PR #{} (`{}`): {err:#}",
-                pr.number, pr.head_ref_name
-            );
-            stale_close_failures.push(format!("#{} (`{}`): {err:#}", pr.number, pr.head_ref_name));
+    {
+        let mut provider = GithubProvider::new(runner, repo_root, &gh_env);
+        match current_pr {
+            Some(pr) => provider.edit_pr(pr.number, &config.default_branch, &pr_title, &pr_body)?,
+            None => {
+                provider.create_pr(&config.default_branch, &release_branch, &pr_title, &pr_body)?
+            }
+        }
+
+        for pr in stale_prs {
+            if let Err(err) = provider.close_stale_release_pr(&pr, &release_branch) {
+                eprintln!(
+                    "warning: failed to close stale release PR #{} (`{}`): {err:#}",
+                    pr.number, pr.head_ref_name
+                );
+                stale_close_failures
+                    .push(format!("#{} (`{}`): {err:#}", pr.number, pr.head_ref_name));
+            }
         }
     }
     if !stale_close_failures.is_empty() {
@@ -156,7 +166,7 @@ pub(crate) fn run_next_version_with_runner(
     config_path: Option<&Path>,
     runner: &mut dyn CommandRunner,
 ) -> Result<()> {
-    let config = load_supported_config(config_path, repo_root, "next-version")?;
+    let config = load_config(config_path, repo_root)?;
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
     let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template)? else {
@@ -167,15 +177,97 @@ pub(crate) fn run_next_version_with_runner(
     Ok(())
 }
 
-fn load_supported_config(
-    config_path: Option<&Path>,
+pub(crate) fn run_changelog_with_runner(
     repo_root: &Path,
-    command_name: &str,
-) -> Result<ResolvedConfig> {
+    config_path: Option<&Path>,
+    runner: &mut dyn CommandRunner,
+) -> Result<()> {
+    let config = load_config(config_path, repo_root)?;
+    if !config.release_pr.changelog.enabled {
+        println!("Changelog generation is disabled. Skipping changelog.");
+        return Ok(());
+    }
+
+    let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
+        .context("Invalid normalized release tag template.")?;
+    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template)? else {
+        println!("No releasable commits found. Skipping changelog.");
+        return Ok(());
+    };
+
+    let next_version_string = next_release.next_version.to_string();
+    let next_tag = tag_template.render(&next_version_string);
+    match config.release_pr.changelog.provider {
+        ChangelogProvider::GitCliff => run_git_cliff_changelog(
+            runner,
+            repo_root,
+            &next_tag,
+            &config.release_pr.changelog.output_file,
+        )?,
+        ChangelogProvider::Changelogen => run_changelogen_changelog(
+            runner,
+            repo_root,
+            &next_version_string,
+            &config.release_pr.changelog.output_file,
+            &config.release_pr.changelog.changelogen.version,
+        )?,
+    }
+
+    println!("Generated changelog for tag {next_tag}.");
+    Ok(())
+}
+
+pub(crate) fn run_tag_with_runner(
+    repo_root: &Path,
+    config_path: Option<&Path>,
+    tag_arg: Option<&str>,
+    target_arg: Option<&str>,
+    runner: &mut dyn CommandRunner,
+    github_event_path_override: Option<&Path>,
+) -> Result<()> {
+    let config = load_config(config_path, repo_root)?;
+    if !config.release_pr.tagging.enabled && tag_arg.is_none() {
+        println!("Tagging is disabled. Skipping tag creation.");
+        return Ok(());
+    }
+
+    let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
+        .context("Invalid normalized release tag template.")?;
+    let tag_request = resolve_tag_request(
+        repo_root,
+        &config,
+        &tag_template,
+        tag_arg,
+        target_arg,
+        github_event_path_override,
+    )?;
+    let Some(tag_request) = tag_request else {
+        return Ok(());
+    };
+
+    create_and_push_tag(
+        runner,
+        repo_root,
+        &tag_request.tag,
+        &tag_request.target,
+        tag_request.explicit,
+    )
+}
+
+fn load_config(config_path: Option<&Path>, repo_root: &Path) -> Result<ResolvedConfig> {
     let config = config::load(config_path, repo_root)?;
     for warning in &config.warnings {
         eprintln!("warning: {warning}");
     }
+    Ok(config)
+}
+
+fn load_github_config(
+    config_path: Option<&Path>,
+    repo_root: &Path,
+    command_name: &str,
+) -> Result<ResolvedConfig> {
+    let config = load_config(config_path, repo_root)?;
 
     if config.provider != Provider::Github {
         bail!(
@@ -185,6 +277,272 @@ fn load_supported_config(
     }
 
     Ok(config)
+}
+
+fn run_git_cliff_changelog(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    tag: &str,
+    output_file: &str,
+) -> Result<()> {
+    run_checked(
+        runner,
+        repo_root,
+        "git-cliff",
+        vec![
+            "--config".to_string(),
+            "cliff.toml".to_string(),
+            "--unreleased".to_string(),
+            "--tag".to_string(),
+            tag.to_string(),
+            "--prepend".to_string(),
+            output_file.to_string(),
+        ],
+        &[],
+        "Failed to generate changelog with git-cliff.",
+    )?;
+    Ok(())
+}
+
+fn run_changelogen_changelog(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    version: &str,
+    output_file: &str,
+    changelogen_version: &str,
+) -> Result<()> {
+    run_checked(
+        runner,
+        repo_root,
+        "npx",
+        vec![
+            "--yes".to_string(),
+            format!("changelogen@{changelogen_version}"),
+            "--to".to_string(),
+            "HEAD".to_string(),
+            "-r".to_string(),
+            version.to_string(),
+            "--output".to_string(),
+            output_file.to_string(),
+        ],
+        &[],
+        "Failed to generate changelog with changelogen.",
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TagRequest {
+    tag: String,
+    target: String,
+    explicit: bool,
+}
+
+fn resolve_tag_request(
+    repo_root: &Path,
+    config: &ResolvedConfig,
+    tag_template: &TagTemplate,
+    tag_arg: Option<&str>,
+    target_arg: Option<&str>,
+    github_event_path_override: Option<&Path>,
+) -> Result<Option<TagRequest>> {
+    if let Some(tag) = tag_arg {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            bail!("`--tag` cannot be empty.");
+        }
+        validate_explicit_tag(tag, tag_template)?;
+        let target = target_arg
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("HEAD");
+        return Ok(Some(TagRequest {
+            tag: tag.to_string(),
+            target: target.to_string(),
+            explicit: true,
+        }));
+    }
+
+    if config.provider != Provider::Github {
+        bail!(
+            "Provider `{}` is configured, but `brel tag` event mode currently supports only `github`. Pass `--tag` and `--target` for manual tag mode.",
+            config.provider
+        );
+    }
+
+    let event_path = match github_event_path_override {
+        Some(path) => path.to_path_buf(),
+        None => std::env::var_os("GITHUB_EVENT_PATH")
+            .map(PathBuf::from)
+            .context("Missing `GITHUB_EVENT_PATH`. Pass `--tag` for manual tag mode.")?,
+    };
+    let event = read_github_pull_request_event(repo_root, &event_path)?;
+    let Some(pull_request) = event.pull_request else {
+        println!("GitHub event does not contain a pull request. Skipping tag creation.");
+        return Ok(None);
+    };
+    if !pull_request.merged.unwrap_or(false) {
+        println!("GitHub pull request was not merged. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    let body = pull_request.body.unwrap_or_default();
+    if !body.contains(MANAGED_RELEASE_PR_MARKER) {
+        println!("PR is not managed by brel. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    let title = pull_request.title.unwrap_or_default();
+    let Some(tag) = parse_release_tag_from_title(&title) else {
+        println!("PR title does not match expected release format. Skipping tag creation.");
+        return Ok(None);
+    };
+    if tag_template.parse_stable_version(tag).is_none() {
+        println!("PR title tag does not match configured tag template. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    let target = target_arg
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or(pull_request.merge_commit_sha)
+        .unwrap_or_default();
+    if target.trim().is_empty() {
+        println!("Missing merge commit SHA. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    Ok(Some(TagRequest {
+        tag: tag.to_string(),
+        target,
+        explicit: false,
+    }))
+}
+
+fn validate_explicit_tag(tag: &str, tag_template: &TagTemplate) -> Result<()> {
+    if tag_template.parse_stable_version(tag).is_some() {
+        return Ok(());
+    }
+
+    bail!("Tag `{tag}` does not match configured `release_pr.tagging.tag_template`.")
+}
+
+fn parse_release_tag_from_title(title: &str) -> Option<&str> {
+    title
+        .strip_prefix("Release ")
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubPullRequestEvent {
+    pull_request: Option<GithubEventPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubEventPullRequest {
+    merged: Option<bool>,
+    title: Option<String>,
+    body: Option<String>,
+    merge_commit_sha: Option<String>,
+}
+
+fn read_github_pull_request_event(
+    repo_root: &Path,
+    event_path: &Path,
+) -> Result<GithubPullRequestEvent> {
+    let full_path = if event_path.is_absolute() {
+        event_path.to_path_buf()
+    } else {
+        repo_root.join(event_path)
+    };
+    let contents = fs::read_to_string(&full_path).with_context(|| {
+        format!(
+            "Failed to read GitHub event file `{}`.",
+            full_path.display()
+        )
+    })?;
+    serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "Failed to parse GitHub event file `{}`.",
+            full_path.display()
+        )
+    })
+}
+
+fn create_and_push_tag(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    tag: &str,
+    target: &str,
+    explicit: bool,
+) -> Result<()> {
+    run_checked(
+        runner,
+        repo_root,
+        "git",
+        vec![
+            "fetch".to_string(),
+            "--tags".to_string(),
+            "origin".to_string(),
+        ],
+        &[],
+        "Failed to fetch git tags.",
+    )?;
+
+    if git_tag_exists(runner, repo_root, tag)? {
+        println!("Tag {tag} already exists. Skipping.");
+        return Ok(());
+    }
+
+    run_checked(
+        runner,
+        repo_root,
+        "git",
+        vec!["tag".to_string(), tag.to_string(), target.to_string()],
+        &[],
+        "Failed to create release tag.",
+    )?;
+    run_checked(
+        runner,
+        repo_root,
+        "git",
+        vec![
+            "push".to_string(),
+            "origin".to_string(),
+            format!("refs/tags/{tag}"),
+        ],
+        &[],
+        "Failed to push release tag.",
+    )?;
+    let mode = if explicit { "manual" } else { "GitHub event" };
+    println!("Created and pushed tag {tag} at {target} ({mode}).");
+    Ok(())
+}
+
+fn git_tag_exists(runner: &mut dyn CommandRunner, repo_root: &Path, tag: &str) -> Result<bool> {
+    let output = runner.run(
+        repo_root,
+        "git",
+        &[
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            format!("refs/tags/{tag}"),
+        ],
+        &[],
+    )?;
+
+    match output.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => bail!(
+            "Failed to inspect tag `{tag}`: git rev-parse exited with {}. {}",
+            output.status,
+            output.stderr.trim()
+        ),
+    }
 }
 
 fn load_template_override(
@@ -448,6 +806,64 @@ fn bump_version(base: &Version, level: BumpLevel) -> Version {
     version.pre = semver::Prerelease::EMPTY;
     version.build = semver::BuildMetadata::EMPTY;
     version
+}
+
+struct GithubProvider<'a, 'repo, 'env> {
+    runner: &'a mut dyn CommandRunner,
+    repo_root: &'repo Path,
+    env: &'env [(String, String)],
+}
+
+impl<'a, 'repo, 'env> GithubProvider<'a, 'repo, 'env> {
+    fn new(
+        runner: &'a mut dyn CommandRunner,
+        repo_root: &'repo Path,
+        env: &'env [(String, String)],
+    ) -> Self {
+        Self {
+            runner,
+            repo_root,
+            env,
+        }
+    }
+
+    fn find_managed_open_prs(&mut self, config: &ResolvedConfig) -> Result<Vec<GhPullRequest>> {
+        find_managed_open_prs(self.runner, self.repo_root, config, self.env)
+    }
+
+    fn create_pr(
+        &mut self,
+        base_branch: &str,
+        release_branch: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<()> {
+        gh_create_pr(
+            self.runner,
+            self.repo_root,
+            base_branch,
+            release_branch,
+            title,
+            body,
+            self.env,
+        )
+    }
+
+    fn edit_pr(&mut self, number: u64, base_branch: &str, title: &str, body: &str) -> Result<()> {
+        gh_edit_pr(
+            self.runner,
+            self.repo_root,
+            number,
+            base_branch,
+            title,
+            body,
+            self.env,
+        )
+    }
+
+    fn close_stale_release_pr(&mut self, pr: &GhPullRequest, release_branch: &str) -> Result<()> {
+        close_stale_release_pr(self.runner, self.repo_root, pr, release_branch, self.env)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -894,6 +1310,26 @@ mod tests {
 
     fn log_entry(sha: &str, subject: &str, body: &str) -> String {
         format!("{sha}\u{1f}{subject}\u{1f}{body}\u{1e}")
+    }
+
+    fn write_pull_request_event(
+        repo_root: &Path,
+        merged: bool,
+        title: &str,
+        body: &str,
+        merge_commit_sha: &str,
+    ) -> PathBuf {
+        let path = repo_root.join("event.json");
+        let event = serde_json::json!({
+            "pull_request": {
+                "merged": merged,
+                "title": title,
+                "body": body,
+                "merge_commit_sha": merge_commit_sha,
+            }
+        });
+        fs::write(&path, serde_json::to_string(&event).unwrap()).unwrap();
+        path
     }
 
     fn args_start_with(args: &[String], expected: &[&str]) -> bool {
@@ -1440,6 +1876,211 @@ tag_template = "{version}"
                 && call.args.contains(&"--title".to_string())
                 && call.args.contains(&"Release 1.3.0".to_string())
         }));
+    }
+
+    #[test]
+    fn tag_manual_mode_creates_and_pushes_tag() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+tag_template = "release-{version}"
+"#,
+        )
+        .unwrap();
+        let mut runner = ScriptedRunner::new(vec![ok(""), status(1), ok(""), ok("")]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            Some("release-1.2.3"),
+            Some("abc123"),
+            &mut runner,
+            None,
+        )
+        .unwrap();
+
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["fetch", "--tags", "origin"])
+        }));
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["tag", "release-1.2.3", "abc123"])
+        }));
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && args_equal(&call.args, &["push", "origin", "refs/tags/release-1.2.3"])
+        }));
+    }
+
+    #[test]
+    fn tag_event_mode_skips_unmanaged_pr() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let event_path = write_pull_request_event(
+            temp_dir.path(),
+            true,
+            "Release v1.2.3",
+            "ordinary pull request",
+            "merge123",
+        );
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(&event_path),
+        )
+        .unwrap();
+
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn tag_event_mode_skips_invalid_release_title() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let event_path = write_pull_request_event(
+            temp_dir.path(),
+            true,
+            "Ship v1.2.3",
+            MANAGED_RELEASE_PR_MARKER,
+            "merge123",
+        );
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(&event_path),
+        )
+        .unwrap();
+
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn tag_event_mode_skips_existing_tag() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let event_path = write_pull_request_event(
+            temp_dir.path(),
+            true,
+            "Release v1.2.3",
+            MANAGED_RELEASE_PR_MARKER,
+            "merge123",
+        );
+        let mut runner = ScriptedRunner::new(vec![ok(""), ok("refs/tags/v1.2.3\n")]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(&event_path),
+        )
+        .unwrap();
+
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.program == "git" && args_start_with(&call.args, &["tag"]))
+        );
+        assert!(!runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["push", "origin", "refs/tags/v1.2.3"])
+        }));
+    }
+
+    #[test]
+    fn tag_event_mode_creates_and_pushes_tag_for_managed_pr() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let event_path = write_pull_request_event(
+            temp_dir.path(),
+            true,
+            "Release v1.2.3",
+            MANAGED_RELEASE_PR_MARKER,
+            "merge123",
+        );
+        let mut runner = ScriptedRunner::new(vec![ok(""), status(1), ok(""), ok("")]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(&event_path),
+        )
+        .unwrap();
+
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["tag", "v1.2.3", "merge123"])
+        }));
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["push", "origin", "refs/tags/v1.2.3"])
+        }));
+    }
+
+    #[test]
+    fn tag_event_mode_requires_github_provider() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitlab"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        let err =
+            run_tag_with_runner(temp_dir.path(), None, None, None, &mut runner, None).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("event mode currently supports only `github`")
+        );
+        assert!(runner.calls.is_empty());
     }
 
     #[test]

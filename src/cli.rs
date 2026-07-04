@@ -12,8 +12,12 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize release workflow scaffolding.
     Init(InitArgs),
+    /// Generate the configured changelog for the next release.
+    Changelog(ChangelogArgs),
     /// Create or update a release PR.
     ReleasePr(ReleasePrArgs),
+    /// Create and push a release tag.
+    Tag(TagArgs),
     /// Compute the next releasable version.
     NextVersion(NextVersionArgs),
     /// Validate a config file.
@@ -38,6 +42,26 @@ pub struct ReleasePrArgs {
     /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
     #[arg(long)]
     pub config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ChangelogArgs {
+    /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct TagArgs {
+    /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// Release tag to create. When omitted, GitHub pull request event data is used.
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Git revision to tag. Defaults to HEAD in manual mode or the PR merge commit in event mode.
+    #[arg(long)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]

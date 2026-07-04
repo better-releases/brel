@@ -1,6 +1,6 @@
 use crate::cli::InitArgs;
 use crate::config::{self, ChangelogProvider, ConfigSource, Provider, ProviderChoice};
-use crate::tag_template::{self, TagTemplate};
+use crate::tag_template;
 use crate::template::{self, WorkflowRenderContext, WorkflowTemplate};
 use crate::workflow;
 use anyhow::{Context, Result, bail};
@@ -221,40 +221,21 @@ pub(crate) fn run_with_interactor(
     let workflow_path = workflow::resolve_workflow_path(&config.workflow_file)?;
     let workflow_absolute_path = repo_root.join(&workflow_path);
     let release_pr_command = build_release_pr_command(options.config_path.as_deref());
-    let next_version_command = build_next_version_command(options.config_path.as_deref());
-    let next_version_output_expr = "${{ steps.next-version.outputs.version }}";
-    let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
-        .context("Invalid normalized release tag template.")?;
-    let next_version_tag_output_expr = tag_template.render(next_version_output_expr);
-    let tagging_template_prefix_shell = tag_template::shell_escape_single(tag_template.prefix());
-    let tagging_template_suffix_shell = tag_template::shell_escape_single(tag_template.suffix());
-    let changelog_output_file_shell =
-        tag_template::shell_escape_single(&config.release_pr.changelog.output_file);
-    let changelogen_package = format!(
-        "changelogen@{}",
-        config.release_pr.changelog.changelogen.version
-    );
-    let changelogen_package_shell = tag_template::shell_escape_single(&changelogen_package);
+    let changelog_command = build_changelog_command(options.config_path.as_deref());
+    let tag_command = build_tag_command(options.config_path.as_deref());
     let rendered = template::render_workflow(
         config.provider,
         WorkflowTemplate::ReleasePr,
         &WorkflowRenderContext {
             default_branch: &config.default_branch,
             release_pr_command: &release_pr_command,
-            next_version_command: &next_version_command,
+            changelog_command: &changelog_command,
+            tag_command: &tag_command,
             github_token_expr: "${{ github.token }}",
             tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
-            next_version_non_empty_expr: "${{ steps.next-version.outputs.version != '' }}",
-            next_version_output_expr,
-            next_version_tag_output_expr: &next_version_tag_output_expr,
             changelog_enabled: config.release_pr.changelog.enabled,
             changelog_provider: config.release_pr.changelog.provider,
-            changelog_output_file: &config.release_pr.changelog.output_file,
-            changelog_output_file_shell: &changelog_output_file_shell,
-            changelogen_package_shell: &changelogen_package_shell,
             tagging_enabled: config.release_pr.tagging.enabled,
-            tagging_template_prefix_shell: &tagging_template_prefix_shell,
-            tagging_template_suffix_shell: &tagging_template_suffix_shell,
         },
     )?;
 
@@ -710,27 +691,20 @@ fn print_tagging_token_notice() {
 }
 
 fn build_release_pr_command(explicit_config_path: Option<&Path>) -> String {
-    let Some(path) = explicit_config_path else {
-        return "brel release-pr".to_string();
-    };
-
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    if file_name == "brel.toml" || file_name == ".brel.toml" {
-        return "brel release-pr".to_string();
-    }
-
-    format!(
-        "brel release-pr --config {}",
-        tag_template::shell_escape_single(path.to_string_lossy().as_ref())
-    )
+    build_brel_command("release-pr", explicit_config_path)
 }
 
-fn build_next_version_command(explicit_config_path: Option<&Path>) -> String {
+fn build_changelog_command(explicit_config_path: Option<&Path>) -> String {
+    build_brel_command("changelog", explicit_config_path)
+}
+
+fn build_tag_command(explicit_config_path: Option<&Path>) -> String {
+    build_brel_command("tag", explicit_config_path)
+}
+
+fn build_brel_command(subcommand: &str, explicit_config_path: Option<&Path>) -> String {
     let Some(path) = explicit_config_path else {
-        return "brel next-version".to_string();
+        return format!("brel {subcommand}");
     };
 
     let file_name = path
@@ -738,11 +712,11 @@ fn build_next_version_command(explicit_config_path: Option<&Path>) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("");
     if file_name == "brel.toml" || file_name == ".brel.toml" {
-        return "brel next-version".to_string();
+        return format!("brel {subcommand}");
     }
 
     format!(
-        "brel next-version --config {}",
+        "brel {subcommand} --config {}",
         tag_template::shell_escape_single(path.to_string_lossy().as_ref())
     )
 }
@@ -1059,15 +1033,13 @@ changelog = { output_file = "docs/CHANGELOG.md" }
         assert!(content.contains("fetch-depth: 0"));
         assert!(content.contains("uses: better-releases/setup-brel@v1"));
         assert!(!content.contains("BREL_RELEASE_REPO"));
-        assert!(content.contains("id: next-version"));
-        assert!(content.contains("next_version=\"$(brel next-version)\""));
-        assert!(content.contains("if: ${{ steps.next-version.outputs.version != '' }}"));
-        assert!(
-            content.contains("args: --unreleased --tag v${{ steps.next-version.outputs.version }}")
-        );
-        assert!(content.contains("--prepend CHANGELOG.md"));
-        assert!(!content.contains("--output CHANGELOG.md"));
-        assert!(content.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(content.contains("run: brel changelog"));
+        assert!(content.contains("run: brel release-pr"));
+        assert!(!content.contains("id: next-version"));
+        assert!(!content.contains("next_version=\"$(brel next-version)\""));
+        assert!(!content.contains("args: --unreleased"));
+        assert!(content.contains("uses: taiki-e/install-action@git-cliff"));
+        assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
         assert!(!content.contains("uses: actions/setup-node@v6"));
         assert!(!content.contains("changelogen@"));
         assert!(!content.contains("pull_request:"));
@@ -1091,8 +1063,10 @@ enabled = false
         let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
         let content = fs::read_to_string(workflow).unwrap();
         assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!content.contains("uses: taiki-e/install-action@git-cliff"));
         assert!(!content.contains("uses: actions/setup-node@v6"));
         assert!(!content.contains("changelogen@"));
+        assert!(!content.contains("run: brel changelog"));
     }
 
     #[test]
@@ -1116,10 +1090,10 @@ output_file = "docs/changelog.md"
         assert!(content.contains("uses: actions/setup-node@v6"));
         assert!(content.contains("node-version: 24"));
         assert!(content.contains("package-manager-cache: false"));
-        assert!(content.contains(
-            "run: npx --yes 'changelogen@0.6.2' --to HEAD -r \"${{ steps.next-version.outputs.version }}\" --output docs/changelog.md"
-        ));
+        assert!(content.contains("run: brel changelog"));
         assert!(!content.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!content.contains("uses: taiki-e/install-action@git-cliff"));
+        assert!(!content.contains("changelogen@0.6.2"));
     }
 
     #[test]
@@ -1141,10 +1115,14 @@ enabled = true
         let content = fs::read_to_string(workflow).unwrap();
         assert!(content.contains("pull_request:"));
         assert!(content.contains("Create release tag"));
+        assert!(content.contains("run: brel tag"));
         assert!(content.contains("if: github.event_name == 'pull_request'"));
         assert!(content.contains("Validate tag push token"));
         assert!(content.contains("BREL_TAG_PUSH_TOKEN"));
         assert!(content.contains("token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
+        assert!(content.contains("uses: better-releases/setup-brel@v1"));
+        assert!(!content.contains("jq -r"));
+        assert!(!content.contains("sed -nE"));
     }
 
     #[test]
@@ -1165,13 +1143,11 @@ tag_template = "release-{version}-prod"
 
         let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
         let content = fs::read_to_string(workflow).unwrap();
-        assert!(content.contains(
-            "args: --unreleased --tag release-${{ steps.next-version.outputs.version }}-prod"
-        ));
-        assert!(content.contains("--prepend CHANGELOG.md"));
-        assert!(!content.contains("--output CHANGELOG.md"));
-        assert!(content.contains("prefix=release-"));
-        assert!(content.contains("suffix=-prod"));
+        assert!(content.contains("run: brel tag"));
+        assert!(content.contains("run: brel changelog"));
+        assert!(!content.contains("args: --unreleased"));
+        assert!(!content.contains("prefix=release-"));
+        assert!(!content.contains("suffix=-prod"));
     }
 
     #[test]
@@ -1199,7 +1175,9 @@ tag_template = "release-{version}-prod"
         let workflow =
             fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
         assert!(!workflow.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!workflow.contains("uses: taiki-e/install-action@git-cliff"));
         assert!(!workflow.contains("uses: actions/setup-node@v6"));
+        assert!(!workflow.contains("run: brel changelog"));
     }
 
     #[test]
@@ -1227,8 +1205,10 @@ tag_template = "release-{version}-prod"
         let workflow =
             fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
         assert!(workflow.contains("uses: actions/setup-node@v6"));
-        assert!(workflow.contains("changelogen@0.6.2"));
+        assert!(workflow.contains("run: brel changelog"));
+        assert!(!workflow.contains("changelogen@0.6.2"));
         assert!(!workflow.contains("uses: orhun/git-cliff-action@v4"));
+        assert!(!workflow.contains("uses: taiki-e/install-action@git-cliff"));
     }
 
     #[test]
@@ -1261,9 +1241,8 @@ tag_template = "release-{version}-prod"
         let workflow =
             fs::read_to_string(temp_dir.path().join(".github/workflows/release-pr.yml")).unwrap();
         assert!(workflow.contains("pull_request:"));
-        assert!(workflow.contains(
-            "args: --unreleased --tag release-${{ steps.next-version.outputs.version }}"
-        ));
+        assert!(workflow.contains("run: brel tag"));
+        assert!(!workflow.contains("args: --unreleased"));
     }
 
     #[test]
