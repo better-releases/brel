@@ -1,3 +1,19 @@
+## [0.8.0] - 2026-07-04
+
+### 🚀 Features
+
+- Changelogen integration
+- Rename release branch when semver changes
+
+### 🐛 Bug Fixes
+
+- *(github)* Update checkout action version
+- Update install instruction in readme
+- Review round
+
+### ⚙️ Miscellaneous Tasks
+
+- Add pr test workflow
 ## [0.7.0] - 2026-03-14
 
 ### 🚀 Features
