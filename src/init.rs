@@ -8,7 +8,7 @@ use dialoguer::{Confirm, Input, Select};
 use similar::TextDiff;
 use std::fs;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, value};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
@@ -644,21 +644,44 @@ fn apply_init_values_to_document(document: &mut DocumentMut, values: &InitPersis
         document["default_branch"] = value(default_branch);
     }
 
-    if let Some(enabled) = values.changelog_enabled {
-        document["release_pr"]["changelog"]["enabled"] = value(enabled);
+    if values.changelog_enabled.is_some() || values.changelog_provider.is_some() {
+        let release_pr = ensure_init_table(document.as_table_mut(), "release_pr");
+        let changelog = ensure_init_table(release_pr, "changelog");
+
+        if let Some(enabled) = values.changelog_enabled {
+            changelog["enabled"] = value(enabled);
+        }
+
+        if let Some(provider) = values.changelog_provider {
+            changelog["provider"] = value(provider.as_str());
+        }
     }
 
-    if let Some(provider) = values.changelog_provider {
-        document["release_pr"]["changelog"]["provider"] = value(provider.as_str());
+    if values.tagging_enabled.is_some() || values.tag_template.is_some() {
+        let release_pr = ensure_init_table(document.as_table_mut(), "release_pr");
+        let tagging = ensure_init_table(release_pr, "tagging");
+
+        if let Some(enabled) = values.tagging_enabled {
+            tagging["enabled"] = value(enabled);
+        }
+
+        if let Some(tag_template) = values.tag_template {
+            tagging["tag_template"] = value(tag_template);
+        }
+    }
+}
+
+fn ensure_init_table<'a>(table: &'a mut Table, key: &str) -> &'a mut Table {
+    let item = table[key].or_insert(Item::Table(Table::new()));
+    if item.as_table().is_none() {
+        let table = std::mem::take(item)
+            .into_table()
+            .expect("init config table key must be table-like");
+        *item = Item::Table(table);
     }
 
-    if let Some(enabled) = values.tagging_enabled {
-        document["release_pr"]["tagging"]["enabled"] = value(enabled);
-    }
-
-    if let Some(tag_template) = values.tag_template {
-        document["release_pr"]["tagging"]["tag_template"] = value(tag_template);
-    }
+    item.as_table_mut()
+        .expect("init config table key must be a table")
 }
 
 fn display_repo_path(repo_root: &Path, path: &Path) -> String {
@@ -888,6 +911,135 @@ mod tests {
             .unwrap()
             .parse::<toml::Value>()
             .unwrap()
+    }
+
+    fn full_init_persistence_values<'a>(
+        default_branch: &'a str,
+        tag_template: &'a str,
+    ) -> InitPersistenceValues<'a> {
+        InitPersistenceValues {
+            provider: Some(Provider::Github),
+            default_branch: Some(default_branch),
+            changelog_enabled: Some(true),
+            changelog_provider: Some(ChangelogProvider::GitCliff),
+            tagging_enabled: Some(true),
+            tag_template: Some(tag_template),
+        }
+    }
+
+    #[test]
+    fn init_values_create_nested_tables_in_fresh_document() {
+        let mut document = DocumentMut::new();
+
+        apply_init_values_to_document(
+            &mut document,
+            &full_init_persistence_values("main", "release-{version}"),
+        );
+
+        let content = document.to_string();
+        assert!(content.contains("[release_pr.changelog]"));
+        assert!(content.contains("[release_pr.tagging]"));
+        let config = content.parse::<toml::Value>().unwrap();
+        assert_eq!(config["provider"].as_str(), Some("github"));
+        assert_eq!(config["default_branch"].as_str(), Some("main"));
+        assert_eq!(
+            config["release_pr"]["changelog"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["release_pr"]["changelog"]["provider"].as_str(),
+            Some("git-cliff")
+        );
+        assert_eq!(
+            config["release_pr"]["tagging"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["release_pr"]["tagging"]["tag_template"].as_str(),
+            Some("release-{version}")
+        );
+    }
+
+    #[test]
+    fn init_values_create_nested_tables_in_minimal_existing_document() {
+        let mut document = "default_branch = \"main\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        apply_init_values_to_document(
+            &mut document,
+            &InitPersistenceValues {
+                provider: None,
+                default_branch: Some("develop"),
+                changelog_enabled: Some(false),
+                changelog_provider: None,
+                tagging_enabled: Some(false),
+                tag_template: None,
+            },
+        );
+
+        let content = document.to_string();
+        assert!(content.contains("[release_pr.changelog]"));
+        assert!(content.contains("[release_pr.tagging]"));
+        let config = content.parse::<toml::Value>().unwrap();
+        assert_eq!(config["default_branch"].as_str(), Some("develop"));
+        assert_eq!(
+            config["release_pr"]["changelog"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["release_pr"]["tagging"]["enabled"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn init_values_preserve_partial_release_pr_tables() {
+        let mut document = r#"
+[release_pr]
+release_branch_pattern = "brel/release/v{{version}}"
+changelog = { output_file = "docs/CHANGELOG.md" }
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        apply_init_values_to_document(
+            &mut document,
+            &InitPersistenceValues {
+                provider: None,
+                default_branch: None,
+                changelog_enabled: Some(true),
+                changelog_provider: Some(ChangelogProvider::Changelogen),
+                tagging_enabled: Some(true),
+                tag_template: Some("v{version}"),
+            },
+        );
+
+        let config = document.to_string().parse::<toml::Value>().unwrap();
+        assert_eq!(
+            config["release_pr"]["release_branch_pattern"].as_str(),
+            Some("brel/release/v{{version}}")
+        );
+        assert_eq!(
+            config["release_pr"]["changelog"]["output_file"].as_str(),
+            Some("docs/CHANGELOG.md")
+        );
+        assert_eq!(
+            config["release_pr"]["changelog"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["release_pr"]["changelog"]["provider"].as_str(),
+            Some("changelogen")
+        );
+        assert_eq!(
+            config["release_pr"]["tagging"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["release_pr"]["tagging"]["tag_template"].as_str(),
+            Some("v{version}")
+        );
     }
 
     #[test]
