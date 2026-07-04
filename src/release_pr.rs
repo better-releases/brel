@@ -129,8 +129,22 @@ pub(crate) fn run_with_runner(
         )?,
     }
 
+    let mut stale_close_failures = Vec::new();
     for pr in stale_prs {
-        close_stale_release_pr(runner, repo_root, &pr, &release_branch, &gh_env)?;
+        if let Err(err) = close_stale_release_pr(runner, repo_root, &pr, &release_branch, &gh_env) {
+            eprintln!(
+                "warning: failed to close stale release PR #{} (`{}`): {err:#}",
+                pr.number, pr.head_ref_name
+            );
+            stale_close_failures.push(format!("#{} (`{}`): {err:#}", pr.number, pr.head_ref_name));
+        }
+    }
+    if !stale_close_failures.is_empty() {
+        bail!(
+            "Failed to close {} stale release pull request(s): {}",
+            stale_close_failures.len(),
+            stale_close_failures.join("; ")
+        );
     }
 
     println!("Release PR prepared for tag {next_tag}.");
@@ -1244,6 +1258,74 @@ default_branch = "main"
                 .any(|call| call.program == "gh" && args_start_with(&call.args, &["pr", "close"]))
         );
         assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.4"],
+                )
+        }));
+    }
+
+    #[test]
+    fn stale_release_pr_close_failure_does_not_skip_remaining_stale_prs() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_pr_json = format!(
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nstale body"}},{{"number":8,"headRefName":"brel/release/v1.2.5","body":"{}\nnewer stale body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER, MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(&existing_pr_json),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+            err_status(1, "close failed"),
+            ok(""),
+            ok(""),
+        ]);
+
+        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("Failed to close 1 stale release pull request"));
+        assert!(err_text.contains("brel/release/v1.2.4"));
+
+        let first_close_idx = call_position(&runner.calls, |call| {
+            call.program == "gh" && args_start_with(&call.args, &["pr", "close", "7"])
+        });
+        let second_close_idx = call_position(&runner.calls, |call| {
+            call.program == "gh" && args_start_with(&call.args, &["pr", "close", "8"])
+        });
+        let second_delete_idx = call_position(&runner.calls, |call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.5"],
+                )
+        });
+
+        assert!(first_close_idx < second_close_idx);
+        assert!(second_close_idx < second_delete_idx);
+        assert!(!runner.calls.iter().any(|call| {
             call.program == "git"
                 && args_equal(
                     &call.args,
