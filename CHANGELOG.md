@@ -1,3 +1,14 @@
+## [0.9.0] - 2026-07-05
+
+### 🚀 Features
+
+- Add interactive mode
+- Replace workflow details with command
+
+### ⚙️ Miscellaneous Tasks
+
+- Update release workflow to build from source
+- Update cliff config
 ## [0.8.0] - 2026-07-04
 
 ### 🚀 Features
