@@ -8,9 +8,12 @@ use crate::version_update;
 use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 pub fn run(args: ReleasePrArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
@@ -47,9 +50,29 @@ pub(crate) fn run_with_runner(
     repo_root: &Path,
     config_path: Option<&Path>,
     runner: &mut dyn CommandRunner,
-    gh_token_override: Option<&str>,
+    auth_token_override: Option<&str>,
 ) -> Result<()> {
-    let config = load_github_config(config_path, repo_root, "release-pr")?;
+    let mut gitlab_client = ReqwestGitlabHttpClient::new()?;
+    run_with_runner_and_gitlab_client(
+        repo_root,
+        config_path,
+        runner,
+        auth_token_override,
+        None,
+        &mut gitlab_client,
+    )
+}
+
+fn run_with_runner_and_gitlab_client(
+    repo_root: &Path,
+    config_path: Option<&Path>,
+    runner: &mut dyn CommandRunner,
+    auth_token_override: Option<&str>,
+    gitlab_env_override: Option<GitlabEnv>,
+    gitlab_client: &mut dyn GitlabHttpClient,
+) -> Result<()> {
+    let config = load_config(config_path, repo_root)?;
+    ensure_release_pr_provider_supported(config.provider, "release-pr")?;
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
 
@@ -77,10 +100,13 @@ pub(crate) fn run_with_runner(
         return Ok(());
     }
 
-    let gh_token = resolve_gh_token(gh_token_override)?;
-    let gh_env = vec![("GH_TOKEN".to_string(), gh_token)];
-    let managed_prs =
-        GithubProvider::new(runner, repo_root, &gh_env).find_managed_open_prs(&config)?;
+    let mut provider = ForgeProvider::new(
+        config.provider,
+        auth_token_override,
+        gitlab_env_override,
+        gitlab_client,
+    )?;
+    let managed_prs = provider.find_managed_open_prs(runner, repo_root, &config)?;
     let release_branch = render_release_branch(
         &config.release_pr.release_branch_pattern,
         &next_version_string,
@@ -130,16 +156,29 @@ pub(crate) fn run_with_runner(
 
     let mut stale_close_failures = Vec::new();
     {
-        let mut provider = GithubProvider::new(runner, repo_root, &gh_env);
         match current_pr {
-            Some(pr) => provider.edit_pr(pr.number, &config.default_branch, &pr_title, &pr_body)?,
-            None => {
-                provider.create_pr(&config.default_branch, &release_branch, &pr_title, &pr_body)?
-            }
+            Some(pr) => provider.edit_pr(
+                runner,
+                repo_root,
+                pr.number,
+                &config.default_branch,
+                &pr_title,
+                &pr_body,
+            )?,
+            None => provider.create_pr(
+                runner,
+                repo_root,
+                &config.default_branch,
+                &release_branch,
+                &pr_title,
+                &pr_body,
+            )?,
         }
 
         for pr in stale_prs {
-            if let Err(err) = provider.close_stale_release_pr(&pr, &release_branch) {
+            if let Err(err) =
+                provider.close_stale_release_pr(runner, repo_root, &pr, &release_branch)
+            {
                 eprintln!(
                     "warning: failed to close stale release PR #{} (`{}`): {err:#}",
                     pr.number, pr.head_ref_name
@@ -225,6 +264,38 @@ pub(crate) fn run_tag_with_runner(
     runner: &mut dyn CommandRunner,
     github_event_path_override: Option<&Path>,
 ) -> Result<()> {
+    let mut gitlab_client = ReqwestGitlabHttpClient::new()?;
+    let mut event_context = TagEventContext {
+        github_event_path_override,
+        gitlab_token_override: None,
+        gitlab_env_override: None,
+        gitlab_client: &mut gitlab_client,
+    };
+    run_tag_with_runner_with_event_context(
+        repo_root,
+        config_path,
+        tag_arg,
+        target_arg,
+        runner,
+        &mut event_context,
+    )
+}
+
+struct TagEventContext<'a> {
+    github_event_path_override: Option<&'a Path>,
+    gitlab_token_override: Option<&'a str>,
+    gitlab_env_override: Option<GitlabEnv>,
+    gitlab_client: &'a mut dyn GitlabHttpClient,
+}
+
+fn run_tag_with_runner_with_event_context(
+    repo_root: &Path,
+    config_path: Option<&Path>,
+    tag_arg: Option<&str>,
+    target_arg: Option<&str>,
+    runner: &mut dyn CommandRunner,
+    event_context: &mut TagEventContext<'_>,
+) -> Result<()> {
     let config = load_config(config_path, repo_root)?;
     if !config.release_pr.tagging.enabled && tag_arg.is_none() {
         println!("Tagging is disabled. Skipping tag creation.");
@@ -239,7 +310,7 @@ pub(crate) fn run_tag_with_runner(
         &tag_template,
         tag_arg,
         target_arg,
-        github_event_path_override,
+        event_context,
     )?;
     let Some(tag_request) = tag_request else {
         return Ok(());
@@ -250,7 +321,7 @@ pub(crate) fn run_tag_with_runner(
         repo_root,
         &tag_request.tag,
         &tag_request.target,
-        tag_request.explicit,
+        tag_request.mode,
     )
 }
 
@@ -262,21 +333,14 @@ fn load_config(config_path: Option<&Path>, repo_root: &Path) -> Result<ResolvedC
     Ok(config)
 }
 
-fn load_github_config(
-    config_path: Option<&Path>,
-    repo_root: &Path,
-    command_name: &str,
-) -> Result<ResolvedConfig> {
-    let config = load_config(config_path, repo_root)?;
-
-    if config.provider != Provider::Github {
+fn ensure_release_pr_provider_supported(provider: Provider, command_name: &str) -> Result<()> {
+    if !matches!(provider, Provider::Github | Provider::Gitlab) {
         bail!(
-            "Provider `{}` is configured, but `brel {command_name}` currently supports only `github`.",
-            config.provider
+            "Provider `{}` is configured, but `brel {command_name}` currently supports only `github` or `gitlab`.",
+            provider
         );
     }
-
-    Ok(config)
+    Ok(())
 }
 
 fn run_git_cliff_changelog(
@@ -335,7 +399,24 @@ fn run_changelogen_changelog(
 struct TagRequest {
     tag: String,
     target: String,
-    explicit: bool,
+    mode: TagRequestMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagRequestMode {
+    Manual,
+    GithubEvent,
+    GitlabEvent,
+}
+
+impl TagRequestMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::GithubEvent => "GitHub event",
+            Self::GitlabEvent => "GitLab event",
+        }
+    }
 }
 
 fn resolve_tag_request(
@@ -344,7 +425,7 @@ fn resolve_tag_request(
     tag_template: &TagTemplate,
     tag_arg: Option<&str>,
     target_arg: Option<&str>,
-    github_event_path_override: Option<&Path>,
+    event_context: &mut TagEventContext<'_>,
 ) -> Result<Option<TagRequest>> {
     if let Some(tag) = tag_arg {
         let tag = tag.trim();
@@ -359,17 +440,37 @@ fn resolve_tag_request(
         return Ok(Some(TagRequest {
             tag: tag.to_string(),
             target: target.to_string(),
-            explicit: true,
+            mode: TagRequestMode::Manual,
         }));
     }
 
-    if config.provider != Provider::Github {
-        bail!(
-            "Provider `{}` is configured, but `brel tag` event mode currently supports only `github`. Pass `--tag` and `--target` for manual tag mode.",
+    match config.provider {
+        Provider::Github => resolve_github_tag_request(
+            repo_root,
+            tag_template,
+            target_arg,
+            event_context.github_event_path_override,
+        ),
+        Provider::Gitlab => resolve_gitlab_tag_request(
+            tag_template,
+            target_arg,
+            event_context.gitlab_token_override,
+            event_context.gitlab_env_override.as_ref(),
+            event_context.gitlab_client,
+        ),
+        Provider::Gitea => bail!(
+            "Provider `{}` is configured, but `brel tag` event mode currently supports only `github` or `gitlab`. Pass `--tag` and `--target` for manual tag mode.",
             config.provider
-        );
+        ),
     }
+}
 
+fn resolve_github_tag_request(
+    repo_root: &Path,
+    tag_template: &TagTemplate,
+    target_arg: Option<&str>,
+    github_event_path_override: Option<&Path>,
+) -> Result<Option<TagRequest>> {
     let event_path = match github_event_path_override {
         Some(path) => path.to_path_buf(),
         None => std::env::var_os("GITHUB_EVENT_PATH")
@@ -416,8 +517,64 @@ fn resolve_tag_request(
     Ok(Some(TagRequest {
         tag: tag.to_string(),
         target,
-        explicit: false,
+        mode: TagRequestMode::GithubEvent,
     }))
+}
+
+fn resolve_gitlab_tag_request(
+    tag_template: &TagTemplate,
+    target_arg: Option<&str>,
+    gitlab_token_override: Option<&str>,
+    gitlab_env_override: Option<&GitlabEnv>,
+    gitlab_client: &mut dyn GitlabHttpClient,
+) -> Result<Option<TagRequest>> {
+    let token = resolve_gitlab_token(gitlab_token_override)?;
+    let env = match gitlab_env_override {
+        Some(env) => env.clone(),
+        None => GitlabEnv::from_env_for_tag()?,
+    };
+    let merge_requests = gitlab_find_merged_merge_requests_for_commit(gitlab_client, &env, &token)?;
+    let managed_merge_requests = merge_requests
+        .iter()
+        .filter(|mr| {
+            mr.description
+                .as_deref()
+                .is_some_and(|body| body.contains(MANAGED_RELEASE_PR_MARKER))
+        })
+        .collect::<Vec<_>>();
+
+    if managed_merge_requests.is_empty() {
+        println!(
+            "GitLab commit is not associated with a brel-managed merge request. Skipping tag creation."
+        );
+        return Ok(None);
+    }
+
+    for merge_request in managed_merge_requests {
+        let title = merge_request.title.as_deref().unwrap_or_default();
+        let Some(tag) = parse_release_tag_from_title(title) else {
+            continue;
+        };
+        if tag_template.parse_stable_version(tag).is_none() {
+            continue;
+        }
+        let target = target_arg
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| env.commit_sha.clone().expect("tag env includes commit sha"));
+
+        return Ok(Some(TagRequest {
+            tag: tag.to_string(),
+            target,
+            mode: TagRequestMode::GitlabEvent,
+        }));
+    }
+
+    println!(
+        "GitLab merge request title does not match expected release format. Skipping tag creation."
+    );
+    Ok(None)
 }
 
 fn validate_explicit_tag(tag: &str, tag_template: &TagTemplate) -> Result<()> {
@@ -476,7 +633,7 @@ fn create_and_push_tag(
     repo_root: &Path,
     tag: &str,
     target: &str,
-    explicit: bool,
+    mode: TagRequestMode,
 ) -> Result<()> {
     run_checked(
         runner,
@@ -516,8 +673,10 @@ fn create_and_push_tag(
         &[],
         "Failed to push release tag.",
     )?;
-    let mode = if explicit { "manual" } else { "GitHub event" };
-    println!("Created and pushed tag {tag} at {target} ({mode}).");
+    println!(
+        "Created and pushed tag {tag} at {target} ({}).",
+        mode.label()
+    );
     Ok(())
 }
 
@@ -583,6 +742,27 @@ fn resolve_gh_token(override_token: Option<&str>) -> Result<String> {
 
     bail!(
         "Missing GitHub auth token. Set `GH_TOKEN` (or `GITHUB_TOKEN`) before running `brel release-pr`."
+    )
+}
+
+fn resolve_gitlab_token(override_token: Option<&str>) -> Result<String> {
+    if let Some(token) = override_token {
+        if token.trim().is_empty() {
+            bail!(
+                "Missing GitLab auth token. Set `BREL_GITLAB_TOKEN` before running GitLab provider commands."
+            );
+        }
+        return Ok(token.to_string());
+    }
+
+    if let Ok(value) = std::env::var("BREL_GITLAB_TOKEN")
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
+
+    bail!(
+        "Missing GitLab auth token. Set `BREL_GITLAB_TOKEN` before running GitLab provider commands."
     )
 }
 
@@ -808,62 +988,142 @@ fn bump_version(base: &Version, level: BumpLevel) -> Version {
     version
 }
 
-struct GithubProvider<'a, 'repo, 'env> {
-    runner: &'a mut dyn CommandRunner,
-    repo_root: &'repo Path,
-    env: &'env [(String, String)],
+enum ForgeProvider<'client> {
+    Github {
+        env: Vec<(String, String)>,
+    },
+    Gitlab {
+        env: GitlabEnv,
+        token: String,
+        client: &'client mut dyn GitlabHttpClient,
+    },
 }
 
-impl<'a, 'repo, 'env> GithubProvider<'a, 'repo, 'env> {
+impl<'client> ForgeProvider<'client> {
     fn new(
-        runner: &'a mut dyn CommandRunner,
-        repo_root: &'repo Path,
-        env: &'env [(String, String)],
-    ) -> Self {
-        Self {
-            runner,
-            repo_root,
-            env,
+        provider: Provider,
+        auth_token_override: Option<&str>,
+        gitlab_env_override: Option<GitlabEnv>,
+        gitlab_client: &'client mut dyn GitlabHttpClient,
+    ) -> Result<Self> {
+        match provider {
+            Provider::Github => {
+                let token = resolve_gh_token(auth_token_override)?;
+                Ok(Self::Github {
+                    env: vec![("GH_TOKEN".to_string(), token)],
+                })
+            }
+            Provider::Gitlab => {
+                let token = resolve_gitlab_token(auth_token_override)?;
+                let env = match gitlab_env_override {
+                    Some(env) => env,
+                    None => GitlabEnv::from_env_for_project()?,
+                };
+                Ok(Self::Gitlab {
+                    env,
+                    token,
+                    client: gitlab_client,
+                })
+            }
+            Provider::Gitea => bail!(
+                "Provider `{}` is configured, but release PR creation currently supports only `github` or `gitlab`.",
+                provider
+            ),
         }
     }
 
-    fn find_managed_open_prs(&mut self, config: &ResolvedConfig) -> Result<Vec<GhPullRequest>> {
-        find_managed_open_prs(self.runner, self.repo_root, config, self.env)
+    fn find_managed_open_prs(
+        &mut self,
+        runner: &mut dyn CommandRunner,
+        repo_root: &Path,
+        config: &ResolvedConfig,
+    ) -> Result<Vec<ForgePullRequest>> {
+        match self {
+            Self::Github { env } => github_find_managed_open_prs(runner, repo_root, config, env),
+            Self::Gitlab { env, token, client } => {
+                gitlab_find_managed_open_merge_requests(*client, env, token, config)
+            }
+        }
     }
 
     fn create_pr(
         &mut self,
+        runner: &mut dyn CommandRunner,
+        repo_root: &Path,
         base_branch: &str,
         release_branch: &str,
         title: &str,
         body: &str,
     ) -> Result<()> {
-        gh_create_pr(
-            self.runner,
-            self.repo_root,
-            base_branch,
-            release_branch,
-            title,
-            body,
-            self.env,
-        )
+        match self {
+            Self::Github { env } => gh_create_pr(
+                runner,
+                repo_root,
+                base_branch,
+                release_branch,
+                title,
+                body,
+                env,
+            ),
+            Self::Gitlab { env, token, client } => gitlab_create_merge_request(
+                *client,
+                env,
+                token,
+                base_branch,
+                release_branch,
+                title,
+                body,
+            ),
+        }
     }
 
-    fn edit_pr(&mut self, number: u64, base_branch: &str, title: &str, body: &str) -> Result<()> {
-        gh_edit_pr(
-            self.runner,
-            self.repo_root,
-            number,
-            base_branch,
-            title,
-            body,
-            self.env,
-        )
+    fn edit_pr(
+        &mut self,
+        runner: &mut dyn CommandRunner,
+        repo_root: &Path,
+        number: u64,
+        base_branch: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Github { env } => {
+                gh_edit_pr(runner, repo_root, number, base_branch, title, body, env)
+            }
+            Self::Gitlab { env, token, client } => {
+                gitlab_update_merge_request(*client, env, token, number, base_branch, title, body)
+            }
+        }
     }
 
-    fn close_stale_release_pr(&mut self, pr: &GhPullRequest, release_branch: &str) -> Result<()> {
-        close_stale_release_pr(self.runner, self.repo_root, pr, release_branch, self.env)
+    fn close_stale_release_pr(
+        &mut self,
+        runner: &mut dyn CommandRunner,
+        repo_root: &Path,
+        pr: &ForgePullRequest,
+        release_branch: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Github { env } => {
+                github_close_stale_release_pr(runner, repo_root, pr, release_branch, env)
+            }
+            Self::Gitlab { env, token, client } => gitlab_close_stale_release_pr(
+                *client,
+                env,
+                token,
+                runner,
+                repo_root,
+                pr,
+                release_branch,
+            ),
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForgePullRequest {
+    number: u64,
+    head_ref_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -874,12 +1134,21 @@ struct GhPullRequest {
     body: Option<String>,
 }
 
-fn find_managed_open_prs(
+impl From<GhPullRequest> for ForgePullRequest {
+    fn from(pr: GhPullRequest) -> Self {
+        Self {
+            number: pr.number,
+            head_ref_name: pr.head_ref_name,
+        }
+    }
+}
+
+fn github_find_managed_open_prs(
     runner: &mut dyn CommandRunner,
     repo_root: &Path,
     config: &ResolvedConfig,
     gh_env: &[(String, String)],
-) -> Result<Vec<GhPullRequest>> {
+) -> Result<Vec<ForgePullRequest>> {
     let output = run_checked(
         runner,
         repo_root,
@@ -907,7 +1176,340 @@ fn find_managed_open_prs(
                 .as_deref()
                 .is_some_and(|body| body.contains(MANAGED_RELEASE_PR_MARKER))
         })
+        .map(ForgePullRequest::from)
         .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitlabEnv {
+    api_v4_url: String,
+    project_id: String,
+    commit_sha: Option<String>,
+}
+
+impl GitlabEnv {
+    fn from_env_for_project() -> Result<Self> {
+        Ok(Self {
+            api_v4_url: required_env("CI_API_V4_URL")?,
+            project_id: required_env("CI_PROJECT_ID")?,
+            commit_sha: std::env::var("CI_COMMIT_SHA")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        })
+    }
+
+    fn from_env_for_tag() -> Result<Self> {
+        let mut env = Self::from_env_for_project()?;
+        let commit_sha = required_env("CI_COMMIT_SHA")?;
+        env.commit_sha = Some(commit_sha);
+        Ok(env)
+    }
+}
+
+fn required_env(name: &str) -> Result<String> {
+    let value = std::env::var(name)
+        .with_context(|| format!("Missing GitLab CI variable `{name}`."))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        bail!("Missing GitLab CI variable `{name}`.");
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitlabHttpMethod {
+    Get,
+    Post,
+    Put,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitlabHttpResponse {
+    status: u16,
+    body: String,
+}
+
+trait GitlabHttpClient {
+    fn request(
+        &mut self,
+        method: GitlabHttpMethod,
+        url: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<GitlabHttpResponse>;
+}
+
+struct ReqwestGitlabHttpClient {
+    client: reqwest::blocking::Client,
+}
+
+const GITLAB_HTTP_TIMEOUT_SECS: u64 = 60;
+
+impl ReqwestGitlabHttpClient {
+    fn new() -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(GITLAB_HTTP_TIMEOUT_SECS))
+            .build()
+            .context("Failed to build GitLab HTTP client.")?;
+        Ok(Self { client })
+    }
+}
+
+impl GitlabHttpClient for ReqwestGitlabHttpClient {
+    fn request(
+        &mut self,
+        method: GitlabHttpMethod,
+        url: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<GitlabHttpResponse> {
+        let request = match method {
+            GitlabHttpMethod::Get => self.client.get(url),
+            GitlabHttpMethod::Post => self.client.post(url),
+            GitlabHttpMethod::Put => self.client.put(url),
+        }
+        .header("PRIVATE-TOKEN", token)
+        .header("Accept", "application/json");
+
+        let request = match body {
+            Some(body) => request.json(&body),
+            None => request,
+        };
+
+        let response = request
+            .send()
+            .with_context(|| format!("Failed to send GitLab API request to `{url}`."))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .with_context(|| format!("Failed to read GitLab API response from `{url}`."))?;
+
+        Ok(GitlabHttpResponse { status, body })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitlabMergeRequest {
+    iid: u64,
+    #[serde(default)]
+    source_branch: String,
+    title: Option<String>,
+    description: Option<String>,
+}
+
+impl From<GitlabMergeRequest> for ForgePullRequest {
+    fn from(merge_request: GitlabMergeRequest) -> Self {
+        Self {
+            number: merge_request.iid,
+            head_ref_name: merge_request.source_branch,
+        }
+    }
+}
+
+fn gitlab_find_managed_open_merge_requests(
+    client: &mut dyn GitlabHttpClient,
+    env: &GitlabEnv,
+    token: &str,
+    config: &ResolvedConfig,
+) -> Result<Vec<ForgePullRequest>> {
+    let url = format!(
+        "{}?state=opened&target_branch={}",
+        gitlab_api_url(env, "merge_requests"),
+        url_encode(&config.default_branch)
+    );
+    let merge_requests: Vec<GitlabMergeRequest> = gitlab_request_json(
+        client,
+        GitlabHttpMethod::Get,
+        &url,
+        token,
+        None,
+        "Failed to list open merge requests via GitLab API.",
+    )?;
+
+    Ok(merge_requests
+        .into_iter()
+        .filter(|merge_request| {
+            merge_request
+                .description
+                .as_deref()
+                .is_some_and(|body| body.contains(MANAGED_RELEASE_PR_MARKER))
+        })
+        .map(ForgePullRequest::from)
+        .collect())
+}
+
+fn gitlab_create_merge_request(
+    client: &mut dyn GitlabHttpClient,
+    env: &GitlabEnv,
+    token: &str,
+    base_branch: &str,
+    release_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<()> {
+    let _: serde_json::Value = gitlab_request_json(
+        client,
+        GitlabHttpMethod::Post,
+        &gitlab_api_url(env, "merge_requests"),
+        token,
+        Some(serde_json::json!({
+            "source_branch": release_branch,
+            "target_branch": base_branch,
+            "title": title,
+            "description": body,
+        })),
+        "Failed to create release merge request via GitLab API.",
+    )?;
+    Ok(())
+}
+
+fn gitlab_update_merge_request(
+    client: &mut dyn GitlabHttpClient,
+    env: &GitlabEnv,
+    token: &str,
+    iid: u64,
+    base_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<()> {
+    let _: serde_json::Value = gitlab_request_json(
+        client,
+        GitlabHttpMethod::Put,
+        &gitlab_api_url(env, &format!("merge_requests/{iid}")),
+        token,
+        Some(serde_json::json!({
+            "target_branch": base_branch,
+            "title": title,
+            "description": body,
+        })),
+        "Failed to update existing release merge request via GitLab API.",
+    )?;
+    Ok(())
+}
+
+fn gitlab_close_stale_release_pr(
+    client: &mut dyn GitlabHttpClient,
+    env: &GitlabEnv,
+    token: &str,
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    pr: &ForgePullRequest,
+    release_branch: &str,
+) -> Result<()> {
+    let close_comment = format!(
+        "Closing this managed release PR because the next release version changed and the release branch is now `{release_branch}`."
+    );
+    gitlab_close_merge_request(client, env, token, pr.number, &close_comment)?;
+    git_delete_remote_branch_best_effort(runner, repo_root, &pr.head_ref_name);
+    Ok(())
+}
+
+fn gitlab_close_merge_request(
+    client: &mut dyn GitlabHttpClient,
+    env: &GitlabEnv,
+    token: &str,
+    iid: u64,
+    close_comment: &str,
+) -> Result<()> {
+    let _: serde_json::Value = gitlab_request_json(
+        client,
+        GitlabHttpMethod::Post,
+        &gitlab_api_url(env, &format!("merge_requests/{iid}/notes")),
+        token,
+        Some(serde_json::json!({
+            "body": close_comment,
+        })),
+        "Failed to comment on stale release merge request via GitLab API.",
+    )?;
+    let _: serde_json::Value = gitlab_request_json(
+        client,
+        GitlabHttpMethod::Put,
+        &gitlab_api_url(env, &format!("merge_requests/{iid}")),
+        token,
+        Some(serde_json::json!({
+            "state_event": "close",
+        })),
+        "Failed to close stale release merge request via GitLab API.",
+    )?;
+    Ok(())
+}
+
+fn gitlab_find_merged_merge_requests_for_commit(
+    client: &mut dyn GitlabHttpClient,
+    env: &GitlabEnv,
+    token: &str,
+) -> Result<Vec<GitlabMergeRequest>> {
+    let commit_sha = env
+        .commit_sha
+        .as_deref()
+        .context("Missing GitLab CI variable `CI_COMMIT_SHA`.")?;
+    let url = format!(
+        "{}?state=merged",
+        gitlab_api_url(
+            env,
+            &format!(
+                "repository/commits/{}/merge_requests",
+                url_encode(commit_sha)
+            )
+        )
+    );
+    gitlab_request_json(
+        client,
+        GitlabHttpMethod::Get,
+        &url,
+        token,
+        None,
+        "Failed to list merged merge requests for GitLab commit.",
+    )
+}
+
+fn gitlab_request_json<T: DeserializeOwned>(
+    client: &mut dyn GitlabHttpClient,
+    method: GitlabHttpMethod,
+    url: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+    context: &str,
+) -> Result<T> {
+    let response = client.request(method, url, token, body)?;
+    if !(200..300).contains(&response.status) {
+        let details = response.body.trim();
+        let details = if details.is_empty() {
+            "no response body"
+        } else {
+            details
+        };
+        bail!(
+            "{context} GitLab API returned HTTP {}: {details}",
+            response.status
+        );
+    }
+
+    serde_json::from_str(&response.body)
+        .with_context(|| format!("{context} Failed to parse GitLab API response."))
+}
+
+fn gitlab_api_url(env: &GitlabEnv, path: &str) -> String {
+    format!(
+        "{}/projects/{}/{}",
+        env.api_v4_url.trim_end_matches('/'),
+        url_encode(&env.project_id),
+        path.trim_start_matches('/')
+    )
+}
+
+fn url_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
 }
 
 fn git_checkout_branch(
@@ -1092,10 +1694,10 @@ fn gh_edit_pr(
     Ok(())
 }
 
-fn close_stale_release_pr(
+fn github_close_stale_release_pr(
     runner: &mut dyn CommandRunner,
     repo_root: &Path,
-    pr: &GhPullRequest,
+    pr: &ForgePullRequest,
     release_branch: &str,
     gh_env: &[(String, String)],
 ) -> Result<()> {
@@ -1265,6 +1867,48 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct RecordedGitlabRequest {
+        method: GitlabHttpMethod,
+        url: String,
+        token: String,
+        body: Option<serde_json::Value>,
+    }
+
+    struct ScriptedGitlabClient {
+        responses: VecDeque<GitlabHttpResponse>,
+        requests: Vec<RecordedGitlabRequest>,
+    }
+
+    impl ScriptedGitlabClient {
+        fn new(responses: Vec<GitlabHttpResponse>) -> Self {
+            Self {
+                responses: responses.into(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl GitlabHttpClient for ScriptedGitlabClient {
+        fn request(
+            &mut self,
+            method: GitlabHttpMethod,
+            url: &str,
+            token: &str,
+            body: Option<serde_json::Value>,
+        ) -> Result<GitlabHttpResponse> {
+            self.requests.push(RecordedGitlabRequest {
+                method,
+                url: url.to_string(),
+                token: token.to_string(),
+                body,
+            });
+            self.responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("Missing scripted GitLab response for `{url}`"))
+        }
+    }
+
     impl CommandRunner for ScriptedRunner {
         fn run(
             &mut self,
@@ -1305,6 +1949,28 @@ mod tests {
             status: code,
             stdout: String::new(),
             stderr: stderr.to_string(),
+        }
+    }
+
+    fn http_ok(body: &str) -> GitlabHttpResponse {
+        GitlabHttpResponse {
+            status: 200,
+            body: body.to_string(),
+        }
+    }
+
+    fn http_created(body: &str) -> GitlabHttpResponse {
+        GitlabHttpResponse {
+            status: 201,
+            body: body.to_string(),
+        }
+    }
+
+    fn gitlab_env() -> GitlabEnv {
+        GitlabEnv {
+            api_v4_url: "https://gitlab.example.com/api/v4".to_string(),
+            project_id: "123".to_string(),
+            commit_sha: Some("merge123".to_string()),
         }
     }
 
@@ -2059,12 +2725,100 @@ enabled = true
     }
 
     #[test]
-    fn tag_event_mode_requires_github_provider() {
+    fn gitlab_tag_event_mode_skips_unmanaged_merge_request() {
         let temp_dir = tempdir().unwrap();
         fs::write(
             temp_dir.path().join("brel.toml"),
             r#"
 provider = "gitlab"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut runner = ScriptedRunner::new(vec![]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![http_ok(
+            r#"[{"iid":7,"title":"Release v1.2.3","description":"ordinary merge request"}]"#,
+        )]);
+        let mut event_context = TagEventContext {
+            github_event_path_override: None,
+            gitlab_token_override: Some("token"),
+            gitlab_env_override: Some(gitlab_env()),
+            gitlab_client: &mut gitlab,
+        };
+
+        run_tag_with_runner_with_event_context(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            &mut event_context,
+        )
+        .unwrap();
+
+        assert_eq!(gitlab.requests.len(), 1);
+        assert_eq!(gitlab.requests[0].method, GitlabHttpMethod::Get);
+        assert_eq!(
+            gitlab.requests[0].url,
+            "https://gitlab.example.com/api/v4/projects/123/repository/commits/merge123/merge_requests?state=merged"
+        );
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn gitlab_tag_event_mode_creates_and_pushes_tag_for_managed_merge_request() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitlab"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let managed_mr_json = format!(
+            r#"[{{"iid":7,"title":"Release v1.2.3","description":"{}\nrelease body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![ok(""), status(1), ok(""), ok("")]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![http_ok(&managed_mr_json)]);
+        let mut event_context = TagEventContext {
+            github_event_path_override: None,
+            gitlab_token_override: Some("token"),
+            gitlab_env_override: Some(gitlab_env()),
+            gitlab_client: &mut gitlab,
+        };
+
+        run_tag_with_runner_with_event_context(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            &mut event_context,
+        )
+        .unwrap();
+
+        assert_eq!(gitlab.requests[0].token, "token");
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["tag", "v1.2.3", "merge123"])
+        }));
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["push", "origin", "refs/tags/v1.2.3"])
+        }));
+    }
+
+    #[test]
+    fn tag_event_mode_rejects_unsupported_provider() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitea"
 
 [release_pr.tagging]
 enabled = true
@@ -2078,7 +2832,7 @@ enabled = true
 
         assert!(
             err.to_string()
-                .contains("event mode currently supports only `github`")
+                .contains("event mode currently supports only `github` or `gitlab`")
         );
         assert!(runner.calls.is_empty());
     }
@@ -2369,6 +3123,253 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
                 .iter()
                 .any(|(key, value)| key == "GH_TOKEN" && value == "abc-token")
         }));
+    }
+
+    #[test]
+    fn gitlab_release_pr_creates_merge_request() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitlab"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![http_ok("[]"), http_created("{}")]);
+
+        run_with_runner_and_gitlab_client(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            Some("token"),
+            Some(gitlab_env()),
+            &mut gitlab,
+        )
+        .unwrap();
+
+        assert!(runner.calls.iter().all(|call| call.program != "gh"));
+        assert_eq!(gitlab.requests.len(), 2);
+        assert_eq!(gitlab.requests[0].method, GitlabHttpMethod::Get);
+        assert_eq!(
+            gitlab.requests[0].url,
+            "https://gitlab.example.com/api/v4/projects/123/merge_requests?state=opened&target_branch=main"
+        );
+        assert_eq!(gitlab.requests[0].token, "token");
+        assert_eq!(gitlab.requests[1].method, GitlabHttpMethod::Post);
+        assert_eq!(
+            gitlab.requests[1].url,
+            "https://gitlab.example.com/api/v4/projects/123/merge_requests"
+        );
+        let body = gitlab.requests[1].body.as_ref().unwrap();
+        assert_eq!(body["source_branch"], "brel/release/v1.3.0");
+        assert_eq!(body["target_branch"], "main");
+        assert_eq!(body["title"], "Release v1.3.0");
+        assert!(
+            body["description"]
+                .as_str()
+                .unwrap()
+                .contains(MANAGED_RELEASE_PR_MARKER)
+        );
+    }
+
+    #[test]
+    fn gitlab_release_pr_updates_existing_merge_request() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitlab"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_mr_json = format!(
+            r#"[{{"iid":7,"source_branch":"brel/release/v1.3.0","description":"{}\nold body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![http_ok(&existing_mr_json), http_ok("{}")]);
+
+        run_with_runner_and_gitlab_client(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            Some("token"),
+            Some(gitlab_env()),
+            &mut gitlab,
+        )
+        .unwrap();
+
+        assert_eq!(gitlab.requests.len(), 2);
+        assert_eq!(gitlab.requests[1].method, GitlabHttpMethod::Put);
+        assert_eq!(
+            gitlab.requests[1].url,
+            "https://gitlab.example.com/api/v4/projects/123/merge_requests/7"
+        );
+        assert_eq!(
+            gitlab.requests[1].body.as_ref().unwrap()["title"],
+            "Release v1.3.0"
+        );
+        assert!(!gitlab.requests.iter().any(|request| {
+            request.method == GitlabHttpMethod::Post && request.url.ends_with("/merge_requests")
+        }));
+    }
+
+    #[test]
+    fn gitlab_stale_release_pr_is_closed_and_branch_deleted() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitlab"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let stale_mr_json = format!(
+            r#"[{{"iid":7,"source_branch":"brel/release/v1.2.4","description":"{}\nstale body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![
+            http_ok(&stale_mr_json),
+            http_created("{}"),
+            http_created("{}"),
+            http_ok("{}"),
+        ]);
+
+        run_with_runner_and_gitlab_client(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            Some("token"),
+            Some(gitlab_env()),
+            &mut gitlab,
+        )
+        .unwrap();
+
+        assert_eq!(gitlab.requests.len(), 4);
+        assert_eq!(gitlab.requests[1].method, GitlabHttpMethod::Post);
+        assert_eq!(
+            gitlab.requests[1].url,
+            "https://gitlab.example.com/api/v4/projects/123/merge_requests"
+        );
+        assert_eq!(gitlab.requests[2].method, GitlabHttpMethod::Post);
+        assert_eq!(
+            gitlab.requests[2].url,
+            "https://gitlab.example.com/api/v4/projects/123/merge_requests/7/notes"
+        );
+        assert!(
+            gitlab.requests[2].body.as_ref().unwrap()["body"]
+                .as_str()
+                .unwrap()
+                .contains("release branch is now `brel/release/v1.3.0`")
+        );
+        assert_eq!(gitlab.requests[3].method, GitlabHttpMethod::Put);
+        assert_eq!(
+            gitlab.requests[3].body.as_ref().unwrap()["state_event"],
+            "close"
+        );
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.4"],
+                )
+        }));
+    }
+
+    #[test]
+    fn missing_gitlab_token_is_an_error() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitlab"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "fix: patch", "")),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![]);
+
+        let err = run_with_runner_and_gitlab_client(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            Some(""),
+            Some(gitlab_env()),
+            &mut gitlab,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Missing GitLab auth token"));
+        assert!(gitlab.requests.is_empty());
     }
 
     #[test]

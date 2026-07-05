@@ -56,7 +56,7 @@ pub struct TagArgs {
     /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
     #[arg(long)]
     pub config: Option<PathBuf>,
-    /// Release tag to create. When omitted, GitHub pull request event data is used.
+    /// Release tag to create. When omitted, provider merge event data is used.
     #[arg(long)]
     pub tag: Option<String>,
     /// Git revision to tag. Defaults to HEAD in manual mode or the PR merge commit in event mode.

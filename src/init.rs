@@ -218,7 +218,7 @@ pub(crate) fn run_with_interactor(
         )?;
     }
 
-    let workflow_path = workflow::resolve_workflow_path(&config.workflow_file)?;
+    let workflow_path = workflow::resolve_workflow_path(config.provider, &config.workflow_file)?;
     let workflow_absolute_path = repo_root.join(&workflow_path);
     let release_pr_command = build_release_pr_command(options.config_path.as_deref());
     let changelog_command = build_changelog_command(options.config_path.as_deref());
@@ -291,8 +291,10 @@ pub(crate) fn run_with_interactor(
         }
     };
 
-    if config.release_pr.tagging.enabled {
-        print_tagging_token_notice();
+    if config.provider == Provider::Gitlab {
+        print_gitlab_token_notice();
+    } else if config.release_pr.tagging.enabled {
+        print_github_tagging_token_notice();
     }
 
     Ok(())
@@ -438,7 +440,7 @@ fn apply_init_selections(config: &mut config::ResolvedConfig, selections: &InitS
 
 fn bail_unsupported_init_provider(provider: Provider) -> Result<()> {
     bail!(
-        "Provider `{}` is configured, but `brel init` currently supports only `github`.",
+        "Provider `{}` is configured, but `brel init` currently supports only `github` or `gitlab`.",
         provider
     )
 }
@@ -679,7 +681,7 @@ fn print_defaults_summary() {
     println!("  workflow_file: release-pr.yml");
 }
 
-fn print_tagging_token_notice() {
+fn print_github_tagging_token_notice() {
     println!(
         "Tagging is enabled. Add repository secret `BREL_TAG_PUSH_TOKEN` \
          (PAT with Contents: Read and write)."
@@ -687,6 +689,13 @@ fn print_tagging_token_notice() {
     println!(
         "Without this token, tags pushed by the workflow will not trigger \
          downstream tag-push workflows."
+    );
+}
+
+fn print_gitlab_token_notice() {
+    println!(
+        "GitLab provider is enabled. Add masked CI/CD variable `BREL_GITLAB_TOKEN` \
+         with API and repository write access."
     );
 }
 
@@ -1046,6 +1055,37 @@ changelog = { output_file = "docs/CHANGELOG.md" }
     }
 
     #[test]
+    fn gitlab_config_creates_gitlab_ci_workflow() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "gitlab"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let workflow = fs::read_to_string(temp_dir.path().join(".gitlab-ci.yml")).unwrap();
+        assert!(workflow.contains("# managed-by: brel"));
+        assert!(workflow.contains("release-tag:"));
+        assert!(workflow.contains("BREL_GITLAB_TOKEN"));
+        assert!(workflow.contains("brel tag"));
+        assert!(workflow.contains("brel release-pr"));
+        assert!(
+            !temp_dir
+                .path()
+                .join(".github/workflows/release-pr.yml")
+                .exists()
+        );
+    }
+
+    #[test]
     fn changelog_step_can_be_disabled() {
         let temp_dir = tempdir().unwrap();
         fs::write(
@@ -1277,7 +1317,7 @@ tag_template = "release-{version}-prod"
     }
 
     #[test]
-    fn interactive_init_rewrites_unsupported_configured_provider_to_github() {
+    fn interactive_init_keeps_configured_gitlab_provider() {
         let temp_dir = tempdir().unwrap();
         fs::write(temp_dir.path().join("brel.toml"), "provider = \"gitlab\"\n").unwrap();
         let mut interactor = MockInteractor::default();
@@ -1290,8 +1330,7 @@ tag_template = "release-{version}-prod"
         .unwrap();
 
         let config = fs::read_to_string(temp_dir.path().join("brel.toml")).unwrap();
-        assert!(config.contains("provider = \"github\""));
-        assert!(!config.contains("provider = \"gitlab\""));
+        assert!(config.contains("provider = \"gitlab\""));
         assert_eq!(
             interactor
                 .provider_choices
@@ -1299,20 +1338,27 @@ tag_template = "release-{version}-prod"
                 .iter()
                 .map(|choice| choice.provider)
                 .collect::<Vec<_>>(),
-            vec![Provider::Github]
+            vec![Provider::Github, Provider::Gitlab]
         );
+
+        let workflow = fs::read_to_string(temp_dir.path().join(".gitlab-ci.yml")).unwrap();
+        assert!(workflow.contains("BREL_GITLAB_TOKEN"));
+        assert!(workflow.contains("brel release-pr"));
     }
 
     #[test]
     fn yes_init_rejects_unsupported_configured_provider() {
         let temp_dir = tempdir().unwrap();
-        fs::write(temp_dir.path().join("brel.toml"), "provider = \"gitlab\"\n").unwrap();
+        fs::write(temp_dir.path().join("brel.toml"), "provider = \"gitea\"\n").unwrap();
         let mut interactor = MockInteractor::default();
 
         let err = run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor)
             .unwrap_err();
 
-        assert!(err.to_string().contains("currently supports only `github`"));
+        assert!(
+            err.to_string()
+                .contains("currently supports only `github` or `gitlab`")
+        );
         assert_eq!(interactor.provider_select_calls, 0);
     }
 
@@ -1438,7 +1484,7 @@ tag_template = "release-{version}-prod"
                 .iter()
                 .map(|choice| choice.provider)
                 .collect::<Vec<_>>(),
-            vec![Provider::Github]
+            vec![Provider::Github, Provider::Gitlab]
         );
     }
 

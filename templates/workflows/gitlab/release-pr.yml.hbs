@@ -1,0 +1,51 @@
+# managed-by: brel
+stages:
+{{#if tagging_enabled}}
+  - release-tag
+{{/if}}
+  - release-pr
+
+variables:
+  GIT_DEPTH: "0"
+
+default:
+  image: rust:latest
+  before_script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - |
+      set -euo pipefail
+      if [ -z "${BREL_GITLAB_TOKEN:-}" ]; then
+        echo "Missing CI/CD variable BREL_GITLAB_TOKEN." >&2
+        echo "Use a masked project/group access token with API and repository write access." >&2
+        exit 1
+      fi
+    - git remote set-url origin "https://oauth2:${BREL_GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git fetch --tags origin
+    - curl --proto '=https' --tlsv1.2 -LsSf https://github.com/better-releases/brel/releases/latest/download/brel-installer.sh | sh
+
+{{#if tagging_enabled}}
+release-tag:
+  stage: release-tag
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{default_branch}}" && $CI_PIPELINE_SOURCE == "push"'
+  script:
+    - {{tag_command}}
+
+{{/if}}
+release-pr:
+  stage: release-pr
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{default_branch}}" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  script:
+{{#if changelog_enabled}}
+{{#if changelog_provider_git_cliff}}
+    - cargo install git-cliff --locked
+{{/if}}
+{{#if changelog_provider_changelogen}}
+    - curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+    - apt-get install -y nodejs
+{{/if}}
+    - {{changelog_command}}
+{{/if}}
+    - {{release_pr_command}}

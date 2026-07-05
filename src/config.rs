@@ -11,6 +11,7 @@ use std::str::FromStr;
 
 pub const DEFAULT_BRANCH: &str = "main";
 pub const DEFAULT_WORKFLOW_FILE: &str = "release-pr.yml";
+pub const DEFAULT_GITLAB_WORKFLOW_FILE: &str = ".gitlab-ci.yml";
 pub const DEFAULT_RELEASE_BRANCH_PATTERN: &str = "brel/release/v{{version}}";
 pub const DEFAULT_COMMIT_AUTHOR_NAME: &str = "brel[bot]";
 pub const DEFAULT_COMMIT_AUTHOR_EMAIL: &str = "brel[bot]@users.noreply.github.com";
@@ -44,7 +45,7 @@ const PROVIDER_CHOICES: &[ProviderChoice] = &[
         provider: Provider::Gitlab,
         config_value: "gitlab",
         prompt_label: "GitLab",
-        init_supported: false,
+        init_supported: true,
     },
     ProviderChoice {
         provider: Provider::Gitea,
@@ -399,7 +400,7 @@ pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> 
 
     let workflow_file = raw
         .workflow_file
-        .unwrap_or_else(|| DEFAULT_WORKFLOW_FILE.to_string())
+        .unwrap_or_else(|| default_workflow_file(provider).to_string())
         .trim()
         .to_string();
     if workflow_file.is_empty() {
@@ -416,6 +417,13 @@ pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> 
         source,
         warnings,
     })
+}
+
+pub fn default_workflow_file(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Github | Provider::Gitea => DEFAULT_WORKFLOW_FILE,
+        Provider::Gitlab => DEFAULT_GITLAB_WORKFLOW_FILE,
+    }
 }
 
 fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleasePrConfig> {
@@ -785,7 +793,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (Provider::Github, "github", "GitHub", true),
-                (Provider::Gitlab, "gitlab", "GitLab", false),
+                (Provider::Gitlab, "gitlab", "GitLab", true),
                 (Provider::Gitea, "gitea", "Gitea", false),
             ]
         );
@@ -802,14 +810,14 @@ mod tests {
     }
 
     #[test]
-    fn init_supported_provider_choices_only_include_github() {
+    fn init_supported_provider_choices_include_github_and_gitlab() {
         let init_supported = Provider::choices()
             .iter()
             .filter(|choice| choice.init_supported)
             .map(|choice| choice.provider)
             .collect::<Vec<_>>();
 
-        assert_eq!(init_supported, vec![Provider::Github]);
+        assert_eq!(init_supported, vec![Provider::Github, Provider::Gitlab]);
     }
 
     #[test]
