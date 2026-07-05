@@ -26,19 +26,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install brel
-        uses: better-releases/setup-brel@v1
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
       - name: Install git-cliff
         uses: taiki-e/install-action@git-cliff
 
       - name: Generate changelog
-        run: brel changelog
+        run: cargo run --locked -- changelog
 
       - name: Generate release PR
         env:
           GH_TOKEN: ${{ github.token }}
-        run: brel release-pr
+        run: cargo run --locked -- release-pr
 
   release-tag:
     if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
@@ -62,8 +67,13 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}
 
-      - name: Install brel
-        uses: better-releases/setup-brel@v1
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
       - name: Create release tag
-        run: brel tag
+        run: cargo run --locked -- tag
