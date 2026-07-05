@@ -22,26 +22,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Install brel
         uses: better-releases/setup-brel@v1
 
-      - name: Compute next version
-        id: next-version
-        run: |
-          set -euo pipefail
-          next_version="$(brel next-version)"
-          echo "version=${next_version}" >> "${GITHUB_OUTPUT}"
+      - name: Install git-cliff
+        uses: taiki-e/install-action@git-cliff
 
       - name: Generate changelog
-        if: ${{ steps.next-version.outputs.version != '' }}
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --unreleased --tag ${{ steps.next-version.outputs.version }} --prepend CHANGELOG.md
+        run: brel changelog
 
       - name: Generate release PR
         env:
@@ -65,75 +57,13 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}
 
+      - name: Install brel
+        uses: better-releases/setup-brel@v1
+
       - name: Create release tag
-        run: |
-          set -euo pipefail
-
-          pr_title="$(jq -r '.pull_request.title // ""' "${GITHUB_EVENT_PATH}")"
-          pr_body="$(jq -r '.pull_request.body // ""' "${GITHUB_EVENT_PATH}")"
-          merge_commit_sha="$(jq -r '.pull_request.merge_commit_sha // ""' "${GITHUB_EVENT_PATH}")"
-
-          if ! printf '%s' "${pr_body}" | grep -Fq '<!-- managed-by: brel -->'; then
-            echo "PR is not managed by brel. Skipping tag creation."
-            exit 0
-          fi
-
-          tag="$(printf '%s' "${pr_title}" | sed -nE 's/^Release (.+)$/\1/p')"
-          if [ -z "${tag}" ]; then
-            echo "PR title does not match expected release format. Skipping tag creation."
-            exit 0
-          fi
-
-          prefix=''
-          suffix=''
-
-          if [ -n "${prefix}" ] && [[ "${tag}" != "${prefix}"* ]]; then
-            echo "PR title tag does not match configured tag template. Skipping tag creation."
-            exit 0
-          fi
-
-          candidate="${tag:${#prefix}}"
-          if [ -n "${suffix}" ]; then
-            if [[ "${candidate}" != *"${suffix}" ]]; then
-              echo "PR title tag does not match configured tag template. Skipping tag creation."
-              exit 0
-            fi
-            if [ "${#candidate}" -lt "${#suffix}" ]; then
-              echo "PR title tag does not match configured tag template. Skipping tag creation."
-              exit 0
-            fi
-            version="${candidate:0:${#candidate}-${#suffix}}"
-          else
-            version="${candidate}"
-          fi
-
-          if ! printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "PR title tag does not contain a stable semver. Skipping tag creation."
-            exit 0
-          fi
-
-          expected_tag="${prefix}${version}${suffix}"
-          if [ "${expected_tag}" != "${tag}" ]; then
-            echo "PR title tag does not match configured tag template. Skipping tag creation."
-            exit 0
-          fi
-
-          if [ -z "${merge_commit_sha}" ]; then
-            echo "Missing merge commit SHA. Skipping tag creation."
-            exit 0
-          fi
-
-          git fetch --tags origin
-          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-            echo "Tag ${tag} already exists. Skipping."
-            exit 0
-          fi
-
-          git tag "${tag}" "${merge_commit_sha}"
-          git push origin "refs/tags/${tag}"
-          echo "Created and pushed tag ${tag} at ${merge_commit_sha}."
+        run: brel tag
