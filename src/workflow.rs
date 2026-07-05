@@ -1,12 +1,13 @@
+use crate::config::Provider;
 use anyhow::{Context, Result, bail};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const MANAGED_MARKER: &str = "# managed-by: brel";
-pub const WORKFLOW_DIR: &str = ".github/workflows";
+pub const GITHUB_WORKFLOW_DIR: &str = ".github/workflows";
 
-pub fn resolve_workflow_path(workflow_file: &str) -> Result<PathBuf> {
+pub fn resolve_workflow_path(provider: Provider, workflow_file: &str) -> Result<PathBuf> {
     let normalized = workflow_file.trim();
     if normalized.is_empty() {
         bail!("`workflow_file` cannot be empty.");
@@ -18,7 +19,14 @@ pub fn resolve_workflow_path(workflow_file: &str) -> Result<PathBuf> {
         );
     }
 
-    Ok(PathBuf::from(WORKFLOW_DIR).join(normalized))
+    match provider {
+        Provider::Github => Ok(PathBuf::from(GITHUB_WORKFLOW_DIR).join(normalized)),
+        Provider::Gitlab => Ok(PathBuf::from(normalized)),
+        Provider::Gitea => bail!(
+            "Provider `{}` is not supported by workflow path resolver in v1.",
+            provider.as_str()
+        ),
+    }
 }
 
 pub fn is_managed(contents: &str) -> bool {
@@ -74,11 +82,17 @@ mod tests {
 
     #[test]
     fn workflow_file_must_be_filename_only() {
-        let path = resolve_workflow_path("release-pr.yml").unwrap();
+        let path = resolve_workflow_path(Provider::Github, "release-pr.yml").unwrap();
         assert_eq!(path, PathBuf::from(".github/workflows/release-pr.yml"));
 
-        assert!(resolve_workflow_path("workflows/release-pr.yml").is_err());
-        assert!(resolve_workflow_path("../release-pr.yml").is_err());
+        assert!(resolve_workflow_path(Provider::Github, "workflows/release-pr.yml").is_err());
+        assert!(resolve_workflow_path(Provider::Github, "../release-pr.yml").is_err());
+    }
+
+    #[test]
+    fn gitlab_workflow_file_lives_at_repo_root() {
+        let path = resolve_workflow_path(Provider::Gitlab, ".gitlab-ci.yml").unwrap();
+        assert_eq!(path, PathBuf::from(".gitlab-ci.yml"));
     }
 
     #[test]
