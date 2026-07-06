@@ -1,0 +1,12 @@
+Script started on Mon Jul  6 17:52:59 2026
+^Dmkdir: /Users/matteo/.cache/oh-my-zsh: Operation not permitted
+rm: /Users/matteo/.zcompdump-Matteos-MacBook-Pro-5.9: Operation not permitted
+/Users/matteo/.oh-my-zsh/oh-my-zsh.sh:129: nice(5) failed: operation not permitted
+unix_listener_tmp: bind "/Users/matteo/.ssh/agent/s.DuodDyIUJM.agent.X7iAS0Z4Cg": Operation not permitted
+main: Couldn't prepare agent socket
+Error connecting to agent: Operation not permitted
+zsh: locking failed for /Users/matteo/.zsh_history: operation not permitted: reading anyway
+[1m[7m%[27m[1m[0m                                                                                ]2;matteo@matteos-macbook-pro1:~/.supacode/repos/brel/feat/gitlab-provider]1;..tlab-provider]7;file://matteos-macbook-pro1.home/Users/matteo/.supacode/repos/brel/feat/gitlab-provider\[0m[27m[24m[J[01;32m➜  [36mgitlab-provider[00m [K[?1h=[?2004h[?2004l
+zsh: locking failed for /Users/matteo/.zsh_history: operation not permitted
+
+Script done on Mon Jul  6 17:53:01 2026

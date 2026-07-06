@@ -377,6 +377,37 @@ fn init_without_config_creates_default_workflow() {
 }
 
 #[test]
+fn init_with_gitlab_provider_creates_gitlab_ci_workflow() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(temp_dir.path().join("brel.toml"), "provider = \"gitlab\"\n").unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created `.gitlab-ci.yml`"))
+        .stdout(predicate::str::contains("BREL_GITLAB_TOKEN"));
+
+    let workflow = temp_dir.path().join(".gitlab-ci.yml");
+    let content = fs::read_to_string(workflow).unwrap();
+    assert!(content.contains("# managed-by: brel"));
+    assert!(content.contains("BREL_GITLAB_TOKEN"));
+    assert!(content.contains(&format!(
+        "cargo install brel --version {} --locked",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert!(!content.contains("releases/latest/download/brel-installer.sh"));
+    assert!(content.contains("brel release-pr"));
+    assert!(
+        !temp_dir
+            .path()
+            .join(".github/workflows/release-pr.yml")
+            .exists()
+    );
+}
+
+#[test]
 fn init_with_disabled_changelog_omits_git_cliff_step() {
     let temp_dir = tempdir().unwrap();
     fs::write(
