@@ -6,6 +6,7 @@ use std::process::Command;
 
 pub const MANAGED_MARKER: &str = "# managed-by: brel";
 pub const GITHUB_WORKFLOW_DIR: &str = ".github/workflows";
+pub const FORGEJO_WORKFLOW_DIR: &str = ".forgejo/workflows";
 
 pub fn resolve_workflow_path(provider: Provider, workflow_file: &str) -> Result<PathBuf> {
     let normalized = workflow_file.trim();
@@ -22,6 +23,7 @@ pub fn resolve_workflow_path(provider: Provider, workflow_file: &str) -> Result<
     match provider {
         Provider::Github => Ok(PathBuf::from(GITHUB_WORKFLOW_DIR).join(normalized)),
         Provider::Gitlab => Ok(PathBuf::from(normalized)),
+        Provider::Forgejo => Ok(PathBuf::from(FORGEJO_WORKFLOW_DIR).join(normalized)),
         Provider::Gitea => bail!(
             "Provider `{}` is not supported by workflow path resolver in v1.",
             provider.as_str()
@@ -93,6 +95,12 @@ mod tests {
     fn gitlab_workflow_file_lives_at_repo_root() {
         let path = resolve_workflow_path(Provider::Gitlab, ".gitlab-ci.yml").unwrap();
         assert_eq!(path, PathBuf::from(".gitlab-ci.yml"));
+    }
+
+    #[test]
+    fn forgejo_workflow_file_lives_under_forgejo_workflows() {
+        let path = resolve_workflow_path(Provider::Forgejo, "release-pr.yml").unwrap();
+        assert_eq!(path, PathBuf::from(".forgejo/workflows/release-pr.yml"));
     }
 
     #[test]

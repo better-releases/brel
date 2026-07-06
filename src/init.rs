@@ -232,6 +232,7 @@ pub(crate) fn run_with_interactor(
             changelog_command: &changelog_command,
             tag_command: &tag_command,
             github_token_expr: "${{ github.token }}",
+            forgejo_token_expr: "${{ forgejo.token }}",
             tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
             changelog_enabled: config.release_pr.changelog.enabled,
             changelog_provider: config.release_pr.changelog.provider,
@@ -291,10 +292,11 @@ pub(crate) fn run_with_interactor(
         }
     };
 
-    if config.provider == Provider::Gitlab {
-        print_gitlab_token_notice();
-    } else if config.release_pr.tagging.enabled {
-        print_github_tagging_token_notice();
+    match config.provider {
+        Provider::Gitlab => print_gitlab_token_notice(),
+        Provider::Forgejo => print_forgejo_token_notice(config.release_pr.tagging.enabled),
+        _ if config.release_pr.tagging.enabled => print_github_tagging_token_notice(),
+        _ => {}
     }
 
     Ok(())
@@ -440,7 +442,7 @@ fn apply_init_selections(config: &mut config::ResolvedConfig, selections: &InitS
 
 fn bail_unsupported_init_provider(provider: Provider) -> Result<()> {
     bail!(
-        "Provider `{}` is configured, but `brel init` currently supports only `github` or `gitlab`.",
+        "Provider `{}` is configured, but `brel init` currently supports only `github`, `gitlab`, or `forgejo`.",
         provider
     )
 }
@@ -697,6 +699,23 @@ fn print_gitlab_token_notice() {
         "GitLab provider is enabled. Add masked CI/CD variable `BREL_GITLAB_TOKEN` \
          with API and repository write access."
     );
+}
+
+fn print_forgejo_token_notice(tagging_enabled: bool) {
+    println!(
+        "Forgejo provider is enabled. The generated workflow uses `BREL_FORGEJO_TOKEN` \
+         from the automatic Forgejo token."
+    );
+    if tagging_enabled {
+        println!(
+            "Tagging is enabled. Add repository secret `BREL_TAG_PUSH_TOKEN` \
+             (access token with repository write access)."
+        );
+        println!(
+            "Without this token, tags pushed by the workflow will not trigger \
+             downstream tag-push workflows."
+        );
+    }
 }
 
 fn build_release_pr_command(explicit_config_path: Option<&Path>) -> String {
@@ -1086,6 +1105,39 @@ enabled = true
     }
 
     #[test]
+    fn forgejo_config_creates_forgejo_workflow() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut interactor = MockInteractor::default();
+
+        run_with_interactor(temp_dir.path(), &init_options(true, false), &mut interactor).unwrap();
+
+        let workflow =
+            fs::read_to_string(temp_dir.path().join(".forgejo/workflows/release-pr.yml")).unwrap();
+        assert!(workflow.contains("# managed-by: brel"));
+        assert!(workflow.contains("uses: https://code.forgejo.org/actions/checkout@v4"));
+        assert!(workflow.contains("BREL_FORGEJO_TOKEN"));
+        assert!(workflow.contains("brel tag"));
+        assert!(workflow.contains("brel release-pr"));
+        assert!(
+            !temp_dir
+                .path()
+                .join(".github/workflows/release-pr.yml")
+                .exists()
+        );
+        assert!(!temp_dir.path().join(".gitlab-ci.yml").exists());
+    }
+
+    #[test]
     fn changelog_step_can_be_disabled() {
         let temp_dir = tempdir().unwrap();
         fs::write(
@@ -1338,7 +1390,7 @@ tag_template = "release-{version}-prod"
                 .iter()
                 .map(|choice| choice.provider)
                 .collect::<Vec<_>>(),
-            vec![Provider::Github, Provider::Gitlab]
+            vec![Provider::Github, Provider::Gitlab, Provider::Forgejo]
         );
 
         let workflow = fs::read_to_string(temp_dir.path().join(".gitlab-ci.yml")).unwrap();
@@ -1357,7 +1409,7 @@ tag_template = "release-{version}-prod"
 
         assert!(
             err.to_string()
-                .contains("currently supports only `github` or `gitlab`")
+                .contains("currently supports only `github`, `gitlab`, or `forgejo`")
         );
         assert_eq!(interactor.provider_select_calls, 0);
     }
@@ -1484,7 +1536,7 @@ tag_template = "release-{version}-prod"
                 .iter()
                 .map(|choice| choice.provider)
                 .collect::<Vec<_>>(),
-            vec![Provider::Github, Provider::Gitlab]
+            vec![Provider::Github, Provider::Gitlab, Provider::Forgejo]
         );
     }
 

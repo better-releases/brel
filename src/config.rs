@@ -23,6 +23,7 @@ pub const DEFAULT_TAGGING_ENABLED: bool = false;
 pub enum Provider {
     Github,
     Gitlab,
+    Forgejo,
     Gitea,
 }
 
@@ -45,6 +46,12 @@ const PROVIDER_CHOICES: &[ProviderChoice] = &[
         provider: Provider::Gitlab,
         config_value: "gitlab",
         prompt_label: "GitLab",
+        init_supported: true,
+    },
+    ProviderChoice {
+        provider: Provider::Forgejo,
+        config_value: "forgejo",
+        prompt_label: "Forgejo",
         init_supported: true,
     },
     ProviderChoice {
@@ -421,7 +428,7 @@ pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> 
 
 pub fn default_workflow_file(provider: Provider) -> &'static str {
     match provider {
-        Provider::Github | Provider::Gitea => DEFAULT_WORKFLOW_FILE,
+        Provider::Github | Provider::Forgejo | Provider::Gitea => DEFAULT_WORKFLOW_FILE,
         Provider::Gitlab => DEFAULT_GITLAB_WORKFLOW_FILE,
     }
 }
@@ -780,7 +787,7 @@ mod tests {
     #[test]
     fn provider_metadata_is_the_source_of_truth() {
         let choices = Provider::choices();
-        assert_eq!(choices.len(), 3);
+        assert_eq!(choices.len(), 4);
         assert_eq!(
             choices
                 .iter()
@@ -794,6 +801,7 @@ mod tests {
             vec![
                 (Provider::Github, "github", "GitHub", true),
                 (Provider::Gitlab, "gitlab", "GitLab", true),
+                (Provider::Forgejo, "forgejo", "Forgejo", true),
                 (Provider::Gitea, "gitea", "Gitea", false),
             ]
         );
@@ -810,14 +818,17 @@ mod tests {
     }
 
     #[test]
-    fn init_supported_provider_choices_include_github_and_gitlab() {
+    fn init_supported_provider_choices_include_github_gitlab_and_forgejo() {
         let init_supported = Provider::choices()
             .iter()
             .filter(|choice| choice.init_supported)
             .map(|choice| choice.provider)
             .collect::<Vec<_>>();
 
-        assert_eq!(init_supported, vec![Provider::Github, Provider::Gitlab]);
+        assert_eq!(
+            init_supported,
+            vec![Provider::Github, Provider::Gitlab, Provider::Forgejo]
+        );
     }
 
     #[test]
@@ -924,6 +935,17 @@ mod tests {
 
         let err = load(None, cwd).unwrap_err();
         assert!(err.to_string().contains("Unsupported provider"));
+    }
+
+    #[test]
+    fn parses_forgejo_provider() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("brel.toml"), "provider = \"forgejo\"").unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(config.provider, Provider::Forgejo);
+        assert_eq!(config.workflow_file, DEFAULT_WORKFLOW_FILE);
     }
 
     #[test]
