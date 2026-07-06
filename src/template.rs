@@ -15,6 +15,7 @@ pub struct WorkflowRenderContext<'a> {
     pub changelog_command: &'a str,
     pub tag_command: &'a str,
     pub github_token_expr: &'a str,
+    pub forgejo_token_expr: &'a str,
     pub tagging_push_token_expr: &'a str,
     pub changelog_enabled: bool,
     pub changelog_provider: ChangelogProvider,
@@ -48,6 +49,20 @@ struct GitlabWorkflowRenderContext<'a> {
     pub tagging_enabled: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ForgejoWorkflowRenderContext<'a> {
+    pub default_branch: &'a str,
+    pub release_pr_command: &'a str,
+    pub changelog_command: &'a str,
+    pub tag_command: &'a str,
+    pub forgejo_token_expr: &'a str,
+    pub brel_version: &'a str,
+    pub changelog_enabled: bool,
+    pub changelog_provider_git_cliff: bool,
+    pub changelog_provider_changelogen: bool,
+    pub tagging_enabled: bool,
+}
+
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 pub struct ReleasePrCommitContext<'a> {
     pub sha_short: &'a str,
@@ -69,6 +84,8 @@ const GITHUB_RELEASE_PR_TEMPLATE: &str =
     include_str!("../templates/workflows/github/release-pr.yml.hbs");
 const GITLAB_RELEASE_PR_TEMPLATE: &str =
     include_str!("../templates/workflows/gitlab/release-pr.yml.hbs");
+const FORGEJO_RELEASE_PR_TEMPLATE: &str =
+    include_str!("../templates/workflows/forgejo/release-pr.yml.hbs");
 const DEFAULT_RELEASE_PR_BODY_TEMPLATE: &str = r#"<!-- managed-by: brel -->
 ## Release {{tag}}
 
@@ -105,6 +122,14 @@ pub fn render_workflow(
                 "gitlab-release-pr",
                 GITLAB_RELEASE_PR_TEMPLATE,
                 &gitlab_context,
+            )
+        }
+        (Provider::Forgejo, WorkflowTemplate::ReleasePr) => {
+            let forgejo_context = forgejo_workflow_render_context(context);
+            render_template(
+                "forgejo-release-pr",
+                FORGEJO_RELEASE_PR_TEMPLATE,
+                &forgejo_context,
             )
         }
         (provider, _) => bail!(
@@ -159,6 +184,29 @@ fn github_workflow_render_context<'a>(
     }
 }
 
+fn forgejo_workflow_render_context<'a>(
+    context: &WorkflowRenderContext<'a>,
+) -> ForgejoWorkflowRenderContext<'a> {
+    ForgejoWorkflowRenderContext {
+        default_branch: context.default_branch,
+        release_pr_command: context.release_pr_command,
+        changelog_command: context.changelog_command,
+        tag_command: context.tag_command,
+        forgejo_token_expr: context.forgejo_token_expr,
+        brel_version: env!("CARGO_PKG_VERSION"),
+        changelog_enabled: context.changelog_enabled,
+        changelog_provider_git_cliff: matches!(
+            context.changelog_provider,
+            ChangelogProvider::GitCliff
+        ),
+        changelog_provider_changelogen: matches!(
+            context.changelog_provider,
+            ChangelogProvider::Changelogen
+        ),
+        tagging_enabled: context.tagging_enabled,
+    }
+}
+
 pub fn render_release_pr_body(
     context: &ReleasePrBodyContext<'_>,
     template_override: Option<&str>,
@@ -194,6 +242,7 @@ mod tests {
                 changelog_command: "brel changelog --config custom.toml",
                 tag_command: "brel tag --config custom.toml",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
@@ -228,6 +277,7 @@ mod tests {
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: false,
                 changelog_provider: ChangelogProvider::GitCliff,
@@ -254,6 +304,7 @@ mod tests {
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::Changelogen,
@@ -286,6 +337,7 @@ mod tests {
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
@@ -321,6 +373,7 @@ mod tests {
                 changelog_command: "brel changelog",
                 tag_command: "brel tag --config custom.toml",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
@@ -345,6 +398,7 @@ mod tests {
                 changelog_command: "brel changelog --config custom.toml",
                 tag_command: "brel tag --config custom.toml",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
@@ -382,6 +436,7 @@ mod tests {
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::Changelogen,
@@ -406,6 +461,7 @@ mod tests {
                 changelog_command: "brel changelog",
                 tag_command: "brel tag --config custom.toml",
                 github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: false,
                 changelog_provider: ChangelogProvider::GitCliff,
@@ -418,6 +474,98 @@ mod tests {
         assert!(rendered.contains("stage: release-tag"));
         assert!(rendered.contains("- brel tag --config custom.toml"));
         assert!(!rendered.contains("pull_request:"));
+        assert!(!rendered.contains("BREL_TAG_PUSH_TOKEN"));
+    }
+
+    #[test]
+    fn renders_forgejo_template_with_release_job() {
+        let rendered = render_workflow(
+            Provider::Forgejo,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr --config custom.toml",
+                changelog_command: "brel changelog --config custom.toml",
+                tag_command: "brel tag --config custom.toml",
+                github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
+                changelog_enabled: true,
+                changelog_provider: ChangelogProvider::GitCliff,
+                tagging_enabled: false,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("# managed-by: brel"));
+        assert!(rendered.contains("runs-on: docker"));
+        assert!(rendered.contains("image: rust:latest"));
+        assert!(rendered.contains("uses: https://code.forgejo.org/actions/checkout@v4"));
+        assert!(rendered.contains("token: ${{ forgejo.token }}"));
+        assert!(rendered.contains(&format!(
+            "cargo install brel --version {} --locked",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(rendered.contains("cargo install git-cliff --locked"));
+        assert!(rendered.contains("run: brel changelog --config custom.toml"));
+        assert!(rendered.contains("run: brel release-pr --config custom.toml"));
+        assert!(rendered.contains("BREL_FORGEJO_TOKEN: ${{ forgejo.token }}"));
+        assert!(rendered.contains("if: forgejo.event_name != 'pull_request'"));
+        assert!(!rendered.contains("GH_TOKEN"));
+        assert!(!rendered.contains("release-tag:"));
+    }
+
+    #[test]
+    fn renders_forgejo_changelogen_steps() {
+        let rendered = render_workflow(
+            Provider::Forgejo,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                changelog_command: "brel changelog",
+                tag_command: "brel tag",
+                github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
+                changelog_enabled: true,
+                changelog_provider: ChangelogProvider::Changelogen,
+                tagging_enabled: false,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("uses: https://code.forgejo.org/actions/setup-node@v4"));
+        assert!(rendered.contains("node-version: 24"));
+        assert!(!rendered.contains("cargo install git-cliff --locked"));
+    }
+
+    #[test]
+    fn renders_forgejo_tagging_job() {
+        let rendered = render_workflow(
+            Provider::Forgejo,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                changelog_command: "brel changelog",
+                tag_command: "brel tag --config custom.toml",
+                github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
+                changelog_enabled: false,
+                changelog_provider: ChangelogProvider::GitCliff,
+                tagging_enabled: true,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("pull_request:"));
+        assert!(rendered.contains("- closed"));
+        assert!(rendered.contains("release-tag:"));
+        assert!(rendered.contains("if: forgejo.event_name == 'pull_request'"));
+        assert!(rendered.contains("run: brel tag --config custom.toml"));
+        assert!(rendered.contains("BREL_FORGEJO_TOKEN"));
         assert!(!rendered.contains("BREL_TAG_PUSH_TOKEN"));
     }
 

@@ -1,0 +1,74 @@
+# managed-by: brel
+name: Release PR
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - {{default_branch}}
+{{#if tagging_enabled}}
+  pull_request:
+    types:
+      - closed
+    branches:
+      - {{default_branch}}
+{{/if}}
+
+jobs:
+  release-pr:
+    if: forgejo.event_name != 'pull_request'
+    runs-on: docker
+    container:
+      image: rust:latest
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: {{forgejo_token_expr}}
+
+      - name: Install brel
+        run: cargo install brel --version {{brel_version}} --locked
+
+{{#if changelog_enabled}}
+{{#if changelog_provider_git_cliff}}
+      - name: Install git-cliff
+        run: cargo install git-cliff --locked
+{{/if}}
+{{#if changelog_provider_changelogen}}
+      - name: Setup Node
+        uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: 24
+{{/if}}
+
+      - name: Generate changelog
+        run: {{changelog_command}}
+
+{{/if}}
+      - name: Generate release PR
+        env:
+          BREL_FORGEJO_TOKEN: {{forgejo_token_expr}}
+        run: {{release_pr_command}}
+{{#if tagging_enabled}}
+
+  release-tag:
+    if: forgejo.event_name == 'pull_request' && forgejo.event.pull_request.merged == true
+    runs-on: docker
+    container:
+      image: rust:latest
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: {{forgejo_token_expr}}
+
+      - name: Install brel
+        run: cargo install brel --version {{brel_version}} --locked
+
+      - name: Create release tag
+        env:
+          BREL_FORGEJO_TOKEN: {{forgejo_token_expr}}
+        run: {{tag_command}}
+{{/if}}

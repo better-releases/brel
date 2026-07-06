@@ -53,16 +53,22 @@ pub(crate) fn run_with_runner(
     auth_token_override: Option<&str>,
 ) -> Result<()> {
     let mut gitlab_client = ReqwestGitlabHttpClient::new()?;
-    run_with_runner_and_gitlab_client(
+    let mut forgejo_client = ReqwestForgejoHttpClient::new()?;
+    run_with_runner_and_clients(
         repo_root,
         config_path,
         runner,
-        auth_token_override,
-        None,
-        &mut gitlab_client,
+        ProviderRuntime {
+            auth_token_override,
+            gitlab_env_override: None,
+            forgejo_env_override: None,
+            gitlab_client: &mut gitlab_client,
+            forgejo_client: &mut forgejo_client,
+        },
     )
 }
 
+#[cfg(test)]
 fn run_with_runner_and_gitlab_client(
     repo_root: &Path,
     config_path: Option<&Path>,
@@ -70,6 +76,35 @@ fn run_with_runner_and_gitlab_client(
     auth_token_override: Option<&str>,
     gitlab_env_override: Option<GitlabEnv>,
     gitlab_client: &mut dyn GitlabHttpClient,
+) -> Result<()> {
+    let mut forgejo_client = ReqwestForgejoHttpClient::new()?;
+    run_with_runner_and_clients(
+        repo_root,
+        config_path,
+        runner,
+        ProviderRuntime {
+            auth_token_override,
+            gitlab_env_override,
+            forgejo_env_override: None,
+            gitlab_client,
+            forgejo_client: &mut forgejo_client,
+        },
+    )
+}
+
+struct ProviderRuntime<'client, 'token> {
+    auth_token_override: Option<&'token str>,
+    gitlab_env_override: Option<GitlabEnv>,
+    forgejo_env_override: Option<ForgejoEnv>,
+    gitlab_client: &'client mut dyn GitlabHttpClient,
+    forgejo_client: &'client mut dyn ForgejoHttpClient,
+}
+
+fn run_with_runner_and_clients(
+    repo_root: &Path,
+    config_path: Option<&Path>,
+    runner: &mut dyn CommandRunner,
+    runtime: ProviderRuntime<'_, '_>,
 ) -> Result<()> {
     let config = load_config(config_path, repo_root)?;
     ensure_release_pr_provider_supported(config.provider, "release-pr")?;
@@ -102,9 +137,11 @@ fn run_with_runner_and_gitlab_client(
 
     let mut provider = ForgeProvider::new(
         config.provider,
-        auth_token_override,
-        gitlab_env_override,
-        gitlab_client,
+        runtime.auth_token_override,
+        runtime.gitlab_env_override,
+        runtime.forgejo_env_override,
+        runtime.gitlab_client,
+        runtime.forgejo_client,
     )?;
     let managed_prs = provider.find_managed_open_prs(runner, repo_root, &config)?;
     let release_branch = render_release_branch(
@@ -267,6 +304,7 @@ pub(crate) fn run_tag_with_runner(
     let mut gitlab_client = ReqwestGitlabHttpClient::new()?;
     let mut event_context = TagEventContext {
         github_event_path_override,
+        forgejo_event_path_override: github_event_path_override,
         gitlab_token_override: None,
         gitlab_env_override: None,
         gitlab_client: &mut gitlab_client,
@@ -283,6 +321,7 @@ pub(crate) fn run_tag_with_runner(
 
 struct TagEventContext<'a> {
     github_event_path_override: Option<&'a Path>,
+    forgejo_event_path_override: Option<&'a Path>,
     gitlab_token_override: Option<&'a str>,
     gitlab_env_override: Option<GitlabEnv>,
     gitlab_client: &'a mut dyn GitlabHttpClient,
@@ -334,9 +373,12 @@ fn load_config(config_path: Option<&Path>, repo_root: &Path) -> Result<ResolvedC
 }
 
 fn ensure_release_pr_provider_supported(provider: Provider, command_name: &str) -> Result<()> {
-    if !matches!(provider, Provider::Github | Provider::Gitlab) {
+    if !matches!(
+        provider,
+        Provider::Github | Provider::Gitlab | Provider::Forgejo
+    ) {
         bail!(
-            "Provider `{}` is configured, but `brel {command_name}` currently supports only `github` or `gitlab`.",
+            "Provider `{}` is configured, but `brel {command_name}` currently supports only `github`, `gitlab`, or `forgejo`.",
             provider
         );
     }
@@ -407,6 +449,7 @@ enum TagRequestMode {
     Manual,
     GithubEvent,
     GitlabEvent,
+    ForgejoEvent,
 }
 
 impl TagRequestMode {
@@ -415,6 +458,7 @@ impl TagRequestMode {
             Self::Manual => "manual",
             Self::GithubEvent => "GitHub event",
             Self::GitlabEvent => "GitLab event",
+            Self::ForgejoEvent => "Forgejo event",
         }
     }
 }
@@ -458,8 +502,14 @@ fn resolve_tag_request(
             event_context.gitlab_env_override.as_ref(),
             event_context.gitlab_client,
         ),
+        Provider::Forgejo => resolve_forgejo_tag_request(
+            repo_root,
+            tag_template,
+            target_arg,
+            event_context.forgejo_event_path_override,
+        ),
         Provider::Gitea => bail!(
-            "Provider `{}` is configured, but `brel tag` event mode currently supports only `github` or `gitlab`. Pass `--tag` and `--target` for manual tag mode.",
+            "Provider `{}` is configured, but `brel tag` event mode currently supports only `github`, `gitlab`, or `forgejo`. Pass `--tag` and `--target` for manual tag mode.",
             config.provider
         ),
     }
@@ -518,6 +568,66 @@ fn resolve_github_tag_request(
         tag: tag.to_string(),
         target,
         mode: TagRequestMode::GithubEvent,
+    }))
+}
+
+fn resolve_forgejo_tag_request(
+    repo_root: &Path,
+    tag_template: &TagTemplate,
+    target_arg: Option<&str>,
+    forgejo_event_path_override: Option<&Path>,
+) -> Result<Option<TagRequest>> {
+    let event_path = match forgejo_event_path_override {
+        Some(path) => path.to_path_buf(),
+        None => std::env::var_os("FORGEJO_EVENT_PATH")
+            .or_else(|| std::env::var_os("GITHUB_EVENT_PATH"))
+            .map(PathBuf::from)
+            .context(
+                "Missing `FORGEJO_EVENT_PATH` (or `GITHUB_EVENT_PATH`). Pass `--tag` for manual tag mode.",
+            )?,
+    };
+    let event = read_forgejo_pull_request_event(repo_root, &event_path)?;
+    let Some(pull_request) = event.pull_request else {
+        println!("Forgejo event does not contain a pull request. Skipping tag creation.");
+        return Ok(None);
+    };
+    if !pull_request.merged.unwrap_or(false) {
+        println!("Forgejo pull request was not merged. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    let body = pull_request.body.unwrap_or_default();
+    if !body.contains(MANAGED_RELEASE_PR_MARKER) {
+        println!("PR is not managed by brel. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    let title = pull_request.title.unwrap_or_default();
+    let Some(tag) = parse_release_tag_from_title(&title) else {
+        println!("PR title does not match expected release format. Skipping tag creation.");
+        return Ok(None);
+    };
+    if tag_template.parse_stable_version(tag).is_none() {
+        println!("PR title tag does not match configured tag template. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    let target = target_arg
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| non_empty_string(pull_request.merge_commit_sha))
+        .or_else(|| non_empty_string(pull_request.merged_commit_id))
+        .unwrap_or_default();
+    if target.trim().is_empty() {
+        println!("Missing merge commit SHA. Skipping tag creation.");
+        return Ok(None);
+    }
+
+    Ok(Some(TagRequest {
+        tag: tag.to_string(),
+        target,
+        mode: TagRequestMode::ForgejoEvent,
     }))
 }
 
@@ -585,6 +695,13 @@ fn validate_explicit_tag(tag: &str, tag_template: &TagTemplate) -> Result<()> {
     bail!("Tag `{tag}` does not match configured `release_pr.tagging.tag_template`.")
 }
 
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
 fn parse_release_tag_from_title(title: &str) -> Option<&str> {
     title
         .strip_prefix("Release ")
@@ -605,6 +722,20 @@ struct GithubEventPullRequest {
     merge_commit_sha: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ForgejoPullRequestEvent {
+    pull_request: Option<ForgejoEventPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoEventPullRequest {
+    merged: Option<bool>,
+    title: Option<String>,
+    body: Option<String>,
+    merge_commit_sha: Option<String>,
+    merged_commit_id: Option<String>,
+}
+
 fn read_github_pull_request_event(
     repo_root: &Path,
     event_path: &Path,
@@ -623,6 +754,29 @@ fn read_github_pull_request_event(
     serde_json::from_str(&contents).with_context(|| {
         format!(
             "Failed to parse GitHub event file `{}`.",
+            full_path.display()
+        )
+    })
+}
+
+fn read_forgejo_pull_request_event(
+    repo_root: &Path,
+    event_path: &Path,
+) -> Result<ForgejoPullRequestEvent> {
+    let full_path = if event_path.is_absolute() {
+        event_path.to_path_buf()
+    } else {
+        repo_root.join(event_path)
+    };
+    let contents = fs::read_to_string(&full_path).with_context(|| {
+        format!(
+            "Failed to read Forgejo event file `{}`.",
+            full_path.display()
+        )
+    })?;
+    serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "Failed to parse Forgejo event file `{}`.",
             full_path.display()
         )
     })
@@ -763,6 +917,29 @@ fn resolve_gitlab_token(override_token: Option<&str>) -> Result<String> {
 
     bail!(
         "Missing GitLab auth token. Set `BREL_GITLAB_TOKEN` before running GitLab provider commands."
+    )
+}
+
+fn resolve_forgejo_token(override_token: Option<&str>) -> Result<String> {
+    if let Some(token) = override_token {
+        if token.trim().is_empty() {
+            bail!(
+                "Missing Forgejo auth token. Set `BREL_FORGEJO_TOKEN` (or `FORGEJO_TOKEN`) before running Forgejo provider commands."
+            );
+        }
+        return Ok(token.to_string());
+    }
+
+    for name in ["BREL_FORGEJO_TOKEN", "FORGEJO_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            return Ok(value);
+        }
+    }
+
+    bail!(
+        "Missing Forgejo auth token. Set `BREL_FORGEJO_TOKEN` (or `FORGEJO_TOKEN`) before running Forgejo provider commands."
     )
 }
 
@@ -997,6 +1174,11 @@ enum ForgeProvider<'client> {
         token: String,
         client: &'client mut dyn GitlabHttpClient,
     },
+    Forgejo {
+        env: ForgejoEnv,
+        token: String,
+        client: &'client mut dyn ForgejoHttpClient,
+    },
 }
 
 impl<'client> ForgeProvider<'client> {
@@ -1004,7 +1186,9 @@ impl<'client> ForgeProvider<'client> {
         provider: Provider,
         auth_token_override: Option<&str>,
         gitlab_env_override: Option<GitlabEnv>,
+        forgejo_env_override: Option<ForgejoEnv>,
         gitlab_client: &'client mut dyn GitlabHttpClient,
+        forgejo_client: &'client mut dyn ForgejoHttpClient,
     ) -> Result<Self> {
         match provider {
             Provider::Github => {
@@ -1025,8 +1209,20 @@ impl<'client> ForgeProvider<'client> {
                     client: gitlab_client,
                 })
             }
+            Provider::Forgejo => {
+                let token = resolve_forgejo_token(auth_token_override)?;
+                let env = match forgejo_env_override {
+                    Some(env) => env,
+                    None => ForgejoEnv::from_env_for_project()?,
+                };
+                Ok(Self::Forgejo {
+                    env,
+                    token,
+                    client: forgejo_client,
+                })
+            }
             Provider::Gitea => bail!(
-                "Provider `{}` is configured, but release PR creation currently supports only `github` or `gitlab`.",
+                "Provider `{}` is configured, but release PR creation currently supports only `github`, `gitlab`, or `forgejo`.",
                 provider
             ),
         }
@@ -1042,6 +1238,9 @@ impl<'client> ForgeProvider<'client> {
             Self::Github { env } => github_find_managed_open_prs(runner, repo_root, config, env),
             Self::Gitlab { env, token, client } => {
                 gitlab_find_managed_open_merge_requests(*client, env, token, config)
+            }
+            Self::Forgejo { env, token, client } => {
+                forgejo_find_managed_open_pull_requests(*client, env, token, config)
             }
         }
     }
@@ -1074,6 +1273,15 @@ impl<'client> ForgeProvider<'client> {
                 title,
                 body,
             ),
+            Self::Forgejo { env, token, client } => forgejo_create_pull_request(
+                *client,
+                env,
+                token,
+                base_branch,
+                release_branch,
+                title,
+                body,
+            ),
         }
     }
 
@@ -1093,6 +1301,9 @@ impl<'client> ForgeProvider<'client> {
             Self::Gitlab { env, token, client } => {
                 gitlab_update_merge_request(*client, env, token, number, base_branch, title, body)
             }
+            Self::Forgejo { env, token, client } => {
+                forgejo_update_pull_request(*client, env, token, number, base_branch, title, body)
+            }
         }
     }
 
@@ -1108,6 +1319,15 @@ impl<'client> ForgeProvider<'client> {
                 github_close_stale_release_pr(runner, repo_root, pr, release_branch, env)
             }
             Self::Gitlab { env, token, client } => gitlab_close_stale_release_pr(
+                *client,
+                env,
+                token,
+                runner,
+                repo_root,
+                pr,
+                release_branch,
+            ),
+            Self::Forgejo { env, token, client } => forgejo_close_stale_release_pr(
                 *client,
                 env,
                 token,
@@ -1178,6 +1398,319 @@ fn github_find_managed_open_prs(
         })
         .map(ForgePullRequest::from)
         .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForgejoEnv {
+    server_url: String,
+    repository: String,
+}
+
+impl ForgejoEnv {
+    fn from_env_for_project() -> Result<Self> {
+        Ok(Self {
+            server_url: required_env_with_alias("FORGEJO_SERVER_URL", "GITHUB_SERVER_URL")?,
+            repository: required_env_with_alias("FORGEJO_REPOSITORY", "GITHUB_REPOSITORY")?,
+        })
+    }
+}
+
+fn required_env_with_alias(primary: &str, alias: &str) -> Result<String> {
+    for name in [primary, alias] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    bail!("Missing Forgejo Actions variable `{primary}` (or `{alias}`).")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForgejoHttpMethod {
+    Get,
+    Post,
+    Patch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForgejoHttpResponse {
+    status: u16,
+    body: String,
+}
+
+trait ForgejoHttpClient {
+    fn request(
+        &mut self,
+        method: ForgejoHttpMethod,
+        url: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<ForgejoHttpResponse>;
+}
+
+struct ReqwestForgejoHttpClient {
+    client: reqwest::blocking::Client,
+}
+
+const FORGEJO_HTTP_TIMEOUT_SECS: u64 = 60;
+
+impl ReqwestForgejoHttpClient {
+    fn new() -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(FORGEJO_HTTP_TIMEOUT_SECS))
+            .build()
+            .context("Failed to build Forgejo HTTP client.")?;
+        Ok(Self { client })
+    }
+}
+
+impl ForgejoHttpClient for ReqwestForgejoHttpClient {
+    fn request(
+        &mut self,
+        method: ForgejoHttpMethod,
+        url: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<ForgejoHttpResponse> {
+        let request = match method {
+            ForgejoHttpMethod::Get => self.client.get(url),
+            ForgejoHttpMethod::Post => self.client.post(url),
+            ForgejoHttpMethod::Patch => self.client.patch(url),
+        }
+        .header("Authorization", format!("token {token}"))
+        .header("Accept", "application/json");
+
+        let request = match body {
+            Some(body) => request.json(&body),
+            None => request,
+        };
+
+        let response = request
+            .send()
+            .with_context(|| format!("Failed to send Forgejo API request to `{url}`."))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .with_context(|| format!("Failed to read Forgejo API response from `{url}`."))?;
+
+        Ok(ForgejoHttpResponse { status, body })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ForgejoPullRequest {
+    number: u64,
+    #[serde(default)]
+    head_branch: String,
+    head: Option<ForgejoPullRequestHead>,
+    body: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ForgejoPullRequestHead {
+    #[serde(default, rename = "ref")]
+    ref_name: String,
+    #[serde(default)]
+    name: String,
+}
+
+impl ForgejoPullRequest {
+    fn head_ref_name(&self) -> String {
+        if !self.head_branch.is_empty() {
+            return self.head_branch.clone();
+        }
+
+        let Some(head) = &self.head else {
+            return String::new();
+        };
+        if !head.ref_name.is_empty() {
+            return head.ref_name.clone();
+        }
+        head.name.clone()
+    }
+}
+
+impl From<ForgejoPullRequest> for ForgePullRequest {
+    fn from(pull_request: ForgejoPullRequest) -> Self {
+        Self {
+            number: pull_request.number,
+            head_ref_name: pull_request.head_ref_name(),
+        }
+    }
+}
+
+fn forgejo_find_managed_open_pull_requests(
+    client: &mut dyn ForgejoHttpClient,
+    env: &ForgejoEnv,
+    token: &str,
+    config: &ResolvedConfig,
+) -> Result<Vec<ForgePullRequest>> {
+    let url = format!(
+        "{}?state=open&base={}",
+        forgejo_api_url(env, "pulls"),
+        url_encode(&config.default_branch)
+    );
+    let pull_requests: Vec<ForgejoPullRequest> = forgejo_request_json(
+        client,
+        ForgejoHttpMethod::Get,
+        &url,
+        token,
+        None,
+        "Failed to list open pull requests via Forgejo API.",
+    )?;
+
+    Ok(pull_requests
+        .into_iter()
+        .filter(|pull_request| {
+            pull_request
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains(MANAGED_RELEASE_PR_MARKER))
+        })
+        .map(ForgePullRequest::from)
+        .collect())
+}
+
+fn forgejo_create_pull_request(
+    client: &mut dyn ForgejoHttpClient,
+    env: &ForgejoEnv,
+    token: &str,
+    base_branch: &str,
+    release_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<()> {
+    let _: serde_json::Value = forgejo_request_json(
+        client,
+        ForgejoHttpMethod::Post,
+        &forgejo_api_url(env, "pulls"),
+        token,
+        Some(serde_json::json!({
+            "base": base_branch,
+            "head": release_branch,
+            "title": title,
+            "body": body,
+        })),
+        "Failed to create release pull request via Forgejo API.",
+    )?;
+    Ok(())
+}
+
+fn forgejo_update_pull_request(
+    client: &mut dyn ForgejoHttpClient,
+    env: &ForgejoEnv,
+    token: &str,
+    number: u64,
+    base_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<()> {
+    let _: serde_json::Value = forgejo_request_json(
+        client,
+        ForgejoHttpMethod::Patch,
+        &forgejo_api_url(env, &format!("pulls/{number}")),
+        token,
+        Some(serde_json::json!({
+            "base": base_branch,
+            "title": title,
+            "body": body,
+        })),
+        "Failed to update existing release pull request via Forgejo API.",
+    )?;
+    Ok(())
+}
+
+fn forgejo_close_stale_release_pr(
+    client: &mut dyn ForgejoHttpClient,
+    env: &ForgejoEnv,
+    token: &str,
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    pr: &ForgePullRequest,
+    release_branch: &str,
+) -> Result<()> {
+    let close_comment = format!(
+        "Closing this managed release PR because the next release version changed and the release branch is now `{release_branch}`."
+    );
+    forgejo_close_pull_request(client, env, token, pr.number, &close_comment)?;
+    git_delete_remote_branch_best_effort(runner, repo_root, &pr.head_ref_name);
+    Ok(())
+}
+
+fn forgejo_close_pull_request(
+    client: &mut dyn ForgejoHttpClient,
+    env: &ForgejoEnv,
+    token: &str,
+    number: u64,
+    close_comment: &str,
+) -> Result<()> {
+    let _: serde_json::Value = forgejo_request_json(
+        client,
+        ForgejoHttpMethod::Post,
+        &forgejo_api_url(env, &format!("issues/{number}/comments")),
+        token,
+        Some(serde_json::json!({
+            "body": close_comment,
+        })),
+        "Failed to comment on stale release pull request via Forgejo API.",
+    )?;
+    let _: serde_json::Value = forgejo_request_json(
+        client,
+        ForgejoHttpMethod::Patch,
+        &forgejo_api_url(env, &format!("pulls/{number}")),
+        token,
+        Some(serde_json::json!({
+            "state": "closed",
+        })),
+        "Failed to close stale release pull request via Forgejo API.",
+    )?;
+    Ok(())
+}
+
+fn forgejo_request_json<T: DeserializeOwned>(
+    client: &mut dyn ForgejoHttpClient,
+    method: ForgejoHttpMethod,
+    url: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+    context: &str,
+) -> Result<T> {
+    let response = client.request(method, url, token, body)?;
+    if !(200..300).contains(&response.status) {
+        let details = response.body.trim();
+        let details = if details.is_empty() {
+            "no response body"
+        } else {
+            details
+        };
+        bail!(
+            "{context} Forgejo API returned HTTP {}: {details}",
+            response.status
+        );
+    }
+
+    serde_json::from_str(&response.body)
+        .with_context(|| format!("{context} Failed to parse Forgejo API response."))
+}
+
+fn forgejo_api_url(env: &ForgejoEnv, path: &str) -> String {
+    format!(
+        "{}/api/v1/repos/{}/{}",
+        env.server_url.trim_end_matches('/'),
+        repo_path_url_encode(&env.repository),
+        path.trim_start_matches('/')
+    )
+}
+
+fn repo_path_url_encode(repository: &str) -> String {
+    repository
+        .split('/')
+        .map(url_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1909,6 +2442,48 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct RecordedForgejoRequest {
+        method: ForgejoHttpMethod,
+        url: String,
+        token: String,
+        body: Option<serde_json::Value>,
+    }
+
+    struct ScriptedForgejoClient {
+        responses: VecDeque<ForgejoHttpResponse>,
+        requests: Vec<RecordedForgejoRequest>,
+    }
+
+    impl ScriptedForgejoClient {
+        fn new(responses: Vec<ForgejoHttpResponse>) -> Self {
+            Self {
+                responses: responses.into(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl ForgejoHttpClient for ScriptedForgejoClient {
+        fn request(
+            &mut self,
+            method: ForgejoHttpMethod,
+            url: &str,
+            token: &str,
+            body: Option<serde_json::Value>,
+        ) -> Result<ForgejoHttpResponse> {
+            self.requests.push(RecordedForgejoRequest {
+                method,
+                url: url.to_string(),
+                token: token.to_string(),
+                body,
+            });
+            self.responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("Missing scripted Forgejo response for `{url}`"))
+        }
+    }
+
     impl CommandRunner for ScriptedRunner {
         fn run(
             &mut self,
@@ -1966,11 +2541,39 @@ mod tests {
         }
     }
 
+    fn forgejo_http_ok(body: &str) -> ForgejoHttpResponse {
+        ForgejoHttpResponse {
+            status: 200,
+            body: body.to_string(),
+        }
+    }
+
+    fn forgejo_http_created(body: &str) -> ForgejoHttpResponse {
+        ForgejoHttpResponse {
+            status: 201,
+            body: body.to_string(),
+        }
+    }
+
+    fn forgejo_http_error(status: u16, body: &str) -> ForgejoHttpResponse {
+        ForgejoHttpResponse {
+            status,
+            body: body.to_string(),
+        }
+    }
+
     fn gitlab_env() -> GitlabEnv {
         GitlabEnv {
             api_v4_url: "https://gitlab.example.com/api/v4".to_string(),
             project_id: "123".to_string(),
             commit_sha: Some("merge123".to_string()),
+        }
+    }
+
+    fn forgejo_env() -> ForgejoEnv {
+        ForgejoEnv {
+            server_url: "https://forgejo.example.com".to_string(),
+            repository: "owner/demo repo".to_string(),
         }
     }
 
@@ -1992,6 +2595,28 @@ mod tests {
                 "title": title,
                 "body": body,
                 "merge_commit_sha": merge_commit_sha,
+            }
+        });
+        fs::write(&path, serde_json::to_string(&event).unwrap()).unwrap();
+        path
+    }
+
+    fn write_forgejo_pull_request_event(
+        repo_root: &Path,
+        merged: bool,
+        title: &str,
+        body: &str,
+        merge_commit_sha: &str,
+        merged_commit_id: &str,
+    ) -> PathBuf {
+        let path = repo_root.join("forgejo-event.json");
+        let event = serde_json::json!({
+            "pull_request": {
+                "merged": merged,
+                "title": title,
+                "body": body,
+                "merge_commit_sha": merge_commit_sha,
+                "merged_commit_id": merged_commit_id,
             }
         });
         fs::write(&path, serde_json::to_string(&event).unwrap()).unwrap();
@@ -2743,6 +3368,7 @@ enabled = true
         )]);
         let mut event_context = TagEventContext {
             github_event_path_override: None,
+            forgejo_event_path_override: None,
             gitlab_token_override: Some("token"),
             gitlab_env_override: Some(gitlab_env()),
             gitlab_client: &mut gitlab,
@@ -2788,6 +3414,7 @@ enabled = true
         let mut gitlab = ScriptedGitlabClient::new(vec![http_ok(&managed_mr_json)]);
         let mut event_context = TagEventContext {
             github_event_path_override: None,
+            forgejo_event_path_override: None,
             gitlab_token_override: Some("token"),
             gitlab_env_override: Some(gitlab_env()),
             gitlab_client: &mut gitlab,
@@ -2806,6 +3433,119 @@ enabled = true
         assert_eq!(gitlab.requests[0].token, "token");
         assert!(runner.calls.iter().any(|call| {
             call.program == "git" && args_equal(&call.args, &["tag", "v1.2.3", "merge123"])
+        }));
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["push", "origin", "refs/tags/v1.2.3"])
+        }));
+    }
+
+    #[test]
+    fn forgejo_tag_event_mode_skips_unmanaged_pull_request() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let event_path = write_forgejo_pull_request_event(
+            temp_dir.path(),
+            true,
+            "Release v1.2.3",
+            "ordinary pull request",
+            "merge123",
+            "",
+        );
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(&event_path),
+        )
+        .unwrap();
+
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn forgejo_tag_event_mode_skips_unmerged_pull_request() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let event_path = write_forgejo_pull_request_event(
+            temp_dir.path(),
+            false,
+            "Release v1.2.3",
+            MANAGED_RELEASE_PR_MARKER,
+            "merge123",
+            "",
+        );
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(&event_path),
+        )
+        .unwrap();
+
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn forgejo_tag_event_mode_creates_tag_with_merged_commit_id_fallback() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+
+[release_pr.tagging]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let event_path = write_forgejo_pull_request_event(
+            temp_dir.path(),
+            true,
+            "Release v1.2.3",
+            MANAGED_RELEASE_PR_MARKER,
+            "",
+            "forgejo-merge123",
+        );
+        let mut runner = ScriptedRunner::new(vec![ok(""), status(1), ok(""), ok("")]);
+
+        run_tag_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(&event_path),
+        )
+        .unwrap();
+
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git" && args_equal(&call.args, &["tag", "v1.2.3", "forgejo-merge123"])
         }));
         assert!(runner.calls.iter().any(|call| {
             call.program == "git" && args_equal(&call.args, &["push", "origin", "refs/tags/v1.2.3"])
@@ -2832,7 +3572,7 @@ enabled = true
 
         assert!(
             err.to_string()
-                .contains("event mode currently supports only `github` or `gitlab`")
+                .contains("event mode currently supports only `github`, `gitlab`, or `forgejo`")
         );
         assert!(runner.calls.is_empty());
     }
@@ -3331,6 +4071,324 @@ default_branch = "main"
                     &["push", "origin", "--delete", "brel/release/v1.2.4"],
                 )
         }));
+    }
+
+    #[test]
+    fn forgejo_release_pr_creates_pull_request() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![]);
+        let mut forgejo =
+            ScriptedForgejoClient::new(vec![forgejo_http_ok("[]"), forgejo_http_created("{}")]);
+
+        run_with_runner_and_clients(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            ProviderRuntime {
+                auth_token_override: Some("token"),
+                gitlab_env_override: None,
+                forgejo_env_override: Some(forgejo_env()),
+                gitlab_client: &mut gitlab,
+                forgejo_client: &mut forgejo,
+            },
+        )
+        .unwrap();
+
+        assert!(runner.calls.iter().all(|call| call.program != "gh"));
+        assert_eq!(forgejo.requests.len(), 2);
+        assert_eq!(forgejo.requests[0].method, ForgejoHttpMethod::Get);
+        assert_eq!(
+            forgejo.requests[0].url,
+            "https://forgejo.example.com/api/v1/repos/owner/demo%20repo/pulls?state=open&base=main"
+        );
+        assert_eq!(forgejo.requests[0].token, "token");
+        assert_eq!(forgejo.requests[1].method, ForgejoHttpMethod::Post);
+        assert_eq!(
+            forgejo.requests[1].url,
+            "https://forgejo.example.com/api/v1/repos/owner/demo%20repo/pulls"
+        );
+        let body = forgejo.requests[1].body.as_ref().unwrap();
+        assert_eq!(body["head"], "brel/release/v1.3.0");
+        assert_eq!(body["base"], "main");
+        assert_eq!(body["title"], "Release v1.3.0");
+        assert!(
+            body["body"]
+                .as_str()
+                .unwrap()
+                .contains(MANAGED_RELEASE_PR_MARKER)
+        );
+    }
+
+    #[test]
+    fn forgejo_release_pr_updates_existing_pull_request() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let existing_pr_json = format!(
+            r#"[{{"number":7,"head":{{"ref":"brel/release/v1.3.0"}},"body":"{}\nold body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![]);
+        let mut forgejo = ScriptedForgejoClient::new(vec![
+            forgejo_http_ok(&existing_pr_json),
+            forgejo_http_ok("{}"),
+        ]);
+
+        run_with_runner_and_clients(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            ProviderRuntime {
+                auth_token_override: Some("token"),
+                gitlab_env_override: None,
+                forgejo_env_override: Some(forgejo_env()),
+                gitlab_client: &mut gitlab,
+                forgejo_client: &mut forgejo,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(forgejo.requests.len(), 2);
+        assert_eq!(forgejo.requests[1].method, ForgejoHttpMethod::Patch);
+        assert_eq!(
+            forgejo.requests[1].url,
+            "https://forgejo.example.com/api/v1/repos/owner/demo%20repo/pulls/7"
+        );
+        assert_eq!(
+            forgejo.requests[1].body.as_ref().unwrap()["title"],
+            "Release v1.3.0"
+        );
+        assert!(!forgejo.requests.iter().any(|request| {
+            request.method == ForgejoHttpMethod::Post && request.url.ends_with("/pulls")
+        }));
+    }
+
+    #[test]
+    fn forgejo_stale_release_pr_is_closed_and_branch_deleted() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+default_branch = "main"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let stale_pr_json = format!(
+            r#"[{{"number":7,"head_branch":"brel/release/v1.2.4","body":"{}\nstale body"}}]"#,
+            MANAGED_RELEASE_PR_MARKER
+        );
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![]);
+        let mut forgejo = ScriptedForgejoClient::new(vec![
+            forgejo_http_ok(&stale_pr_json),
+            forgejo_http_created("{}"),
+            forgejo_http_created("{}"),
+            forgejo_http_ok("{}"),
+        ]);
+
+        run_with_runner_and_clients(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            ProviderRuntime {
+                auth_token_override: Some("token"),
+                gitlab_env_override: None,
+                forgejo_env_override: Some(forgejo_env()),
+                gitlab_client: &mut gitlab,
+                forgejo_client: &mut forgejo,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(forgejo.requests.len(), 4);
+        assert_eq!(forgejo.requests[1].method, ForgejoHttpMethod::Post);
+        assert_eq!(
+            forgejo.requests[1].url,
+            "https://forgejo.example.com/api/v1/repos/owner/demo%20repo/pulls"
+        );
+        assert_eq!(forgejo.requests[2].method, ForgejoHttpMethod::Post);
+        assert_eq!(
+            forgejo.requests[2].url,
+            "https://forgejo.example.com/api/v1/repos/owner/demo%20repo/issues/7/comments"
+        );
+        assert!(
+            forgejo.requests[2].body.as_ref().unwrap()["body"]
+                .as_str()
+                .unwrap()
+                .contains("release branch is now `brel/release/v1.3.0`")
+        );
+        assert_eq!(forgejo.requests[3].method, ForgejoHttpMethod::Patch);
+        assert_eq!(
+            forgejo.requests[3].body.as_ref().unwrap()["state"],
+            "closed"
+        );
+        assert!(runner.calls.iter().any(|call| {
+            call.program == "git"
+                && args_equal(
+                    &call.args,
+                    &["push", "origin", "--delete", "brel/release/v1.2.4"],
+                )
+        }));
+    }
+
+    #[test]
+    fn missing_forgejo_token_is_an_error() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "fix: patch", "")),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![]);
+        let mut forgejo = ScriptedForgejoClient::new(vec![]);
+
+        let err = run_with_runner_and_clients(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            ProviderRuntime {
+                auth_token_override: Some(""),
+                gitlab_env_override: None,
+                forgejo_env_override: Some(forgejo_env()),
+                gitlab_client: &mut gitlab,
+                forgejo_client: &mut forgejo,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Missing Forgejo auth token"));
+        assert!(forgejo.requests.is_empty());
+    }
+
+    #[test]
+    fn forgejo_api_failure_is_actionable() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+provider = "forgejo"
+
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "fix: patch", "")),
+        ]);
+        let mut gitlab = ScriptedGitlabClient::new(vec![]);
+        let mut forgejo =
+            ScriptedForgejoClient::new(vec![forgejo_http_error(500, r#"{"message":"boom"}"#)]);
+
+        let err = run_with_runner_and_clients(
+            temp_dir.path(),
+            None,
+            &mut runner,
+            ProviderRuntime {
+                auth_token_override: Some("token"),
+                gitlab_env_override: None,
+                forgejo_env_override: Some(forgejo_env()),
+                gitlab_client: &mut gitlab,
+                forgejo_client: &mut forgejo,
+            },
+        )
+        .unwrap_err();
+
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("Failed to list open pull requests via Forgejo API."));
+        assert!(err_text.contains("Forgejo API returned HTTP 500"));
+        assert!(err_text.contains("boom"));
     }
 
     #[test]
