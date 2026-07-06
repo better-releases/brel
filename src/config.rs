@@ -182,6 +182,7 @@ impl FromStr for ChangelogProvider {
 pub enum VersionFileFormat {
     Json,
     Toml,
+    Yaml,
 }
 
 impl VersionFileFormat {
@@ -189,6 +190,7 @@ impl VersionFileFormat {
         match self {
             Self::Json => "json",
             Self::Toml => "toml",
+            Self::Yaml => "yaml",
         }
     }
 }
@@ -206,7 +208,10 @@ impl FromStr for VersionFileFormat {
         match value.trim().to_ascii_lowercase().as_str() {
             "json" => Ok(Self::Json),
             "toml" => Ok(Self::Toml),
-            other => bail!("Unsupported format override `{other}`. Expected `json` or `toml`."),
+            "yaml" | "yml" => Ok(Self::Yaml),
+            other => {
+                bail!("Unsupported format override `{other}`. Expected `json`, `toml`, or `yaml`.")
+            }
         }
     }
 }
@@ -953,9 +958,11 @@ provider = "github"
 [release_pr.version_updates]
 "package.json" = ["version"]
 "Cargo.toml" = ["package.version"]
+"workflow.yml" = ["release.version"]
 
 [release_pr.format_overrides]
 "Cargo.toml" = "toml"
+"workflow.yml" = "yaml"
 
 [release_pr.commit_author]
 name = "release bot"
@@ -980,6 +987,18 @@ email = "release@example.com"
         assert_eq!(
             config.release_pr.format_overrides.get("Cargo.toml"),
             Some(&VersionFileFormat::Toml)
+        );
+        assert_eq!(
+            config
+                .release_pr
+                .version_updates
+                .get("workflow.yml")
+                .unwrap(),
+            &vec!["release.version".to_string()]
+        );
+        assert_eq!(
+            config.release_pr.format_overrides.get("workflow.yml"),
+            Some(&VersionFileFormat::Yaml)
         );
         assert_eq!(config.release_pr.commit_author.name, "release bot");
         assert_eq!(config.release_pr.commit_author.email, "release@example.com");

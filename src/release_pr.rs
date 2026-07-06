@@ -2894,6 +2894,55 @@ version = "1.2.3"
     }
 
     #[test]
+    fn release_pr_updates_yaml_version_file() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.version_updates]
+"release.yaml" = ["packages[name=brel].version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("release.yaml"),
+            r#"
+packages:
+  - name: dep
+    version: 0.9.0
+  - name: brel
+    version: 1.2.3
+"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok("[]"),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+
+        let contents = fs::read_to_string(temp_dir.path().join("release.yaml")).unwrap();
+        assert!(contents.contains("name: dep\n    version: 0.9.0"));
+        assert!(contents.contains("name: brel\n    version: \"1.3.0\""));
+
+        let add_call = runner
+            .calls
+            .iter()
+            .find(|call| call.program == "git" && call.args.first() == Some(&"add".to_string()))
+            .expect("missing git add call");
+        assert!(add_call.args.contains(&"release.yaml".to_string()));
+    }
+
+    #[test]
     fn missing_gh_token_is_an_error() {
         let temp_dir = tempdir().unwrap();
         fs::write(
