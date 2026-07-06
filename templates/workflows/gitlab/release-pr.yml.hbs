@@ -21,7 +21,7 @@ default:
       fi
     - git remote set-url origin "https://oauth2:${BREL_GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     - git fetch --tags origin
-    - curl --proto '=https' --tlsv1.2 -LsSf https://github.com/better-releases/brel/releases/latest/download/brel-installer.sh | sh
+    - cargo install brel --version {{brel_version}} --locked
 
 {{#if tagging_enabled}}
 release-tag:

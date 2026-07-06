@@ -41,6 +41,7 @@ struct GitlabWorkflowRenderContext<'a> {
     pub release_pr_command: &'a str,
     pub changelog_command: &'a str,
     pub tag_command: &'a str,
+    pub brel_version: &'a str,
     pub changelog_enabled: bool,
     pub changelog_provider_git_cliff: bool,
     pub changelog_provider_changelogen: bool,
@@ -121,6 +122,7 @@ fn gitlab_workflow_render_context<'a>(
         release_pr_command: context.release_pr_command,
         changelog_command: context.changelog_command,
         tag_command: context.tag_command,
+        brel_version: env!("CARGO_PKG_VERSION"),
         changelog_enabled: context.changelog_enabled,
         changelog_provider_git_cliff: matches!(
             context.changelog_provider,
@@ -355,6 +357,11 @@ mod tests {
         assert!(rendered.contains("image: rust:latest"));
         assert!(rendered.contains("BREL_GITLAB_TOKEN"));
         assert!(rendered.contains("git remote set-url origin"));
+        assert!(rendered.contains(&format!(
+            "cargo install brel --version {} --locked",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(!rendered.contains("releases/latest/download/brel-installer.sh"));
         assert!(rendered.contains("cargo install git-cliff --locked"));
         assert!(rendered.contains("- brel changelog --config custom.toml"));
         assert!(rendered.contains("- brel release-pr --config custom.toml"));

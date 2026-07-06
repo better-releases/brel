@@ -393,6 +393,11 @@ fn init_with_gitlab_provider_creates_gitlab_ci_workflow() {
     let content = fs::read_to_string(workflow).unwrap();
     assert!(content.contains("# managed-by: brel"));
     assert!(content.contains("BREL_GITLAB_TOKEN"));
+    assert!(content.contains(&format!(
+        "cargo install brel --version {} --locked",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert!(!content.contains("releases/latest/download/brel-installer.sh"));
     assert!(content.contains("brel release-pr"));
     assert!(
         !temp_dir
