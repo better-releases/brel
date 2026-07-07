@@ -56,6 +56,7 @@ struct ForgejoWorkflowRenderContext<'a> {
     pub changelog_command: &'a str,
     pub tag_command: &'a str,
     pub forgejo_token_expr: &'a str,
+    pub tagging_push_token_expr: &'a str,
     pub brel_version: &'a str,
     pub changelog_enabled: bool,
     pub changelog_provider_git_cliff: bool,
@@ -193,6 +194,7 @@ fn forgejo_workflow_render_context<'a>(
         changelog_command: context.changelog_command,
         tag_command: context.tag_command,
         forgejo_token_expr: context.forgejo_token_expr,
+        tagging_push_token_expr: context.tagging_push_token_expr,
         brel_version: env!("CARGO_PKG_VERSION"),
         changelog_enabled: context.changelog_enabled,
         changelog_provider_git_cliff: matches!(
@@ -565,8 +567,13 @@ mod tests {
         assert!(rendered.contains("release-tag:"));
         assert!(rendered.contains("if: forgejo.event_name == 'pull_request'"));
         assert!(rendered.contains("run: brel tag --config custom.toml"));
-        assert!(rendered.contains("BREL_FORGEJO_TOKEN"));
-        assert!(!rendered.contains("BREL_TAG_PUSH_TOKEN"));
+        // The release-pr job still authenticates with the automatic token.
+        assert!(rendered.contains("BREL_FORGEJO_TOKEN: ${{ forgejo.token }}"));
+        // The release-tag job checks out and pushes with the tag push token so
+        // that the tag push can trigger downstream workflows.
+        assert!(rendered.contains("Validate tag push token"));
+        assert!(rendered.contains("BREL_TAG_PUSH_TOKEN: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
+        assert!(rendered.contains("token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
     }
 
     #[test]

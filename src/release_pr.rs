@@ -1513,8 +1513,12 @@ struct ForgejoPullRequest {
 struct ForgejoPullRequestHead {
     #[serde(default, rename = "ref")]
     ref_name: String,
-    #[serde(default)]
-    name: String,
+    // Forgejo's `PRBranchInfo` exposes the branch name under the JSON key `label`
+    // (the Go SDK field is `Name`, but its JSON tag is `label`). When the head
+    // branch has been deleted, `ref` becomes `refs/pull/<n>/head` while `label`
+    // still holds the original branch name, so it is the reliable fallback.
+    #[serde(default, rename = "label")]
+    label: String,
 }
 
 impl ForgejoPullRequest {
@@ -1529,7 +1533,7 @@ impl ForgejoPullRequest {
         if !head.ref_name.is_empty() {
             return head.ref_name.clone();
         }
-        head.name.clone()
+        head.label.clone()
     }
 }
 
@@ -4298,6 +4302,38 @@ default_branch = "main"
                     &["push", "origin", "--delete", "brel/release/v1.2.4"],
                 )
         }));
+    }
+
+    #[test]
+    fn forgejo_head_ref_falls_back_to_label_when_ref_is_empty() {
+        // Real Forgejo `PRBranchInfo` exposes the branch under the `label` JSON
+        // key and can leave `ref` empty (or set to `refs/pull/<n>/head`) once the
+        // head branch has been deleted. The managed branch name must still parse.
+        let json = r#"{
+            "number": 7,
+            "head": {
+                "label": "brel/release/v1.2.4",
+                "ref": "",
+                "sha": "abc123",
+                "repo_id": 1
+            },
+            "body": "stale body"
+        }"#;
+        let pull_request: ForgejoPullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pull_request.head_ref_name(), "brel/release/v1.2.4");
+
+        let forge_pr = ForgePullRequest::from(pull_request);
+        assert_eq!(forge_pr.head_ref_name, "brel/release/v1.2.4");
+    }
+
+    #[test]
+    fn forgejo_head_ref_prefers_ref_over_label() {
+        let json = r#"{
+            "number": 7,
+            "head": { "label": "owner:branch", "ref": "brel/release/v1.2.4" }
+        }"#;
+        let pull_request: ForgejoPullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pull_request.head_ref_name(), "brel/release/v1.2.4");
     }
 
     #[test]

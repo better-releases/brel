@@ -294,7 +294,7 @@ pub(crate) fn run_with_interactor(
 
     match config.provider {
         Provider::Gitlab => print_gitlab_token_notice(),
-        Provider::Forgejo => print_forgejo_token_notice(),
+        Provider::Forgejo => print_forgejo_token_notice(config.release_pr.tagging.enabled),
         _ if config.release_pr.tagging.enabled => print_github_tagging_token_notice(),
         _ => {}
     }
@@ -701,11 +701,21 @@ fn print_gitlab_token_notice() {
     );
 }
 
-fn print_forgejo_token_notice() {
+fn print_forgejo_token_notice(tagging_enabled: bool) {
     println!(
         "Forgejo provider is enabled. The generated workflow uses `BREL_FORGEJO_TOKEN` \
          from the automatic Forgejo token."
     );
+    if tagging_enabled {
+        println!(
+            "Tagging is enabled. Add repository secret `BREL_TAG_PUSH_TOKEN` \
+             (access token with repository write access)."
+        );
+        println!(
+            "Without this token, tags pushed by the workflow will not trigger \
+             downstream tag-push workflows."
+        );
+    }
 }
 
 fn build_release_pr_command(explicit_config_path: Option<&Path>) -> String {

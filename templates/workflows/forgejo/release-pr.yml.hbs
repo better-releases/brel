@@ -58,17 +58,27 @@ jobs:
     container:
       image: rust:latest
     steps:
+      - name: Validate tag push token
+        env:
+          BREL_TAG_PUSH_TOKEN: {{tagging_push_token_expr}}
+        run: |
+          set -euo pipefail
+          if [ -z "${BREL_TAG_PUSH_TOKEN}" ]; then
+            echo "Missing repository secret BREL_TAG_PUSH_TOKEN." >&2
+            echo "Use an access token with repository write access to push release tags from this workflow." >&2
+            echo "The automatic forgejo.token does not trigger downstream tag-push workflows." >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: https://code.forgejo.org/actions/checkout@v4
         with:
           fetch-depth: 0
-          token: {{forgejo_token_expr}}
+          token: {{tagging_push_token_expr}}
 
       - name: Install brel
         run: cargo install brel --version {{brel_version}} --locked
 
       - name: Create release tag
-        env:
-          BREL_FORGEJO_TOKEN: {{forgejo_token_expr}}
         run: {{tag_command}}
 {{/if}}

@@ -442,6 +442,32 @@ fn init_with_forgejo_provider_creates_forgejo_workflow() {
 }
 
 #[test]
+fn init_with_forgejo_tagging_uses_tag_push_token() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        "provider = \"forgejo\"\n\n[release_pr.tagging]\nenabled = true\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BREL_TAG_PUSH_TOKEN"));
+
+    let workflow = temp_dir.path().join(".forgejo/workflows/release-pr.yml");
+    let content = fs::read_to_string(workflow).unwrap();
+    assert!(content.contains("release-tag:"));
+    assert!(content.contains("Validate tag push token"));
+    // The release-pr job keeps the automatic token, the release-tag job uses the
+    // push token so its tag push can trigger downstream workflows.
+    assert!(content.contains("BREL_FORGEJO_TOKEN: ${{ forgejo.token }}"));
+    assert!(content.contains("token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
+}
+
+#[test]
 fn init_with_disabled_changelog_omits_git_cliff_step() {
     let temp_dir = tempdir().unwrap();
     fs::write(
