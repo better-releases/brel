@@ -1,3 +1,8 @@
+## [0.10.0] - 2026-07-06
+
+### 🚀 Features
+
+- Add gitlab provider
 ## [0.9.0] - 2026-07-05
 
 ### 🚀 Features
