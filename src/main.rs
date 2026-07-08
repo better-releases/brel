@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod forge;
 mod init;
 mod release_pr;
 mod tag_template;
