@@ -114,6 +114,7 @@ default_branch = "main"
 [release_pr.version_updates]
 "package.json" = ["version"]
 "Cargo.toml" = ["package.version"]
+"release.yaml" = ["release.version"]
 
 [release_pr.format_overrides]
 "Cargo.toml" = "toml"
@@ -166,7 +167,7 @@ When you run `brel release-pr`:
   - index selector: `packages[0].version`
   - filter selector: `package[name=brel].version`
 - Supported file formats:
-  - inferred from extension (`.json`, `.toml`)
+  - inferred from extension (`.json`, `.toml`, `.yaml`, `.yml`)
   - or forced via `release_pr.format_overrides`
 - Updates are fail-fast. The command errors if:
   - a file is missing,
@@ -175,7 +176,8 @@ When you run `brel release-pr`:
   - a selector is invalid,
   - a selector matches no values,
   - a selector uses index/filter on a non-array segment,
-  - a matched value is not a string.
+  - a matched value is not a string,
+  - a YAML matched value uses block scalar syntax (`|` or `>`).
 - Match behavior:
   - all values matched by a selector are updated
   - selectors do not create missing keys/paths
@@ -185,6 +187,7 @@ Example selectors:
 - JSON: `"package.json" = ["version", "tooling.release.version"]`
 - JSON with filter: `"package.json" = ["package[name=brel].version"]`
 - TOML: `"Cargo.toml" = ["package.version"]`
+- YAML: `"release.yaml" = ["release.version", "packages[name=brel].version"]`
 - Cargo.lock (explicit format override required):
 
 ```toml

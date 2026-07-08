@@ -1,6 +1,8 @@
 use crate::config::VersionFileFormat;
 use crate::version_selector::{SegmentQualifier, VersionSelector, parse_selector};
 use anyhow::{Context, Result, bail};
+use saphyr::{MarkedYaml, ScalarStyle, YamlData, YamlLoader};
+use saphyr_parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -380,6 +382,9 @@ pub fn apply_version_updates(
             VersionFileFormat::Toml => {
                 update_toml_file(&file_path, &content, &parsed_selectors, next_version)?
             }
+            VersionFileFormat::Yaml => {
+                update_yaml_file(&file_path, &content, &parsed_selectors, next_version)?
+            }
         };
 
         if changed {
@@ -424,9 +429,10 @@ fn detect_file_format(
     {
         Some("json") => Ok(VersionFileFormat::Json),
         Some("toml") => Ok(VersionFileFormat::Toml),
+        Some("yaml" | "yml") => Ok(VersionFileFormat::Yaml),
         _ => bail!(
             "Cannot infer file format for `{relative_path}`. Use `release_pr.format_overrides` \
-             with `json` or `toml`."
+             with `json`, `toml`, or `yaml`."
         ),
     }
 }
@@ -948,6 +954,291 @@ fn set_toml_string_in_value(
     }
 }
 
+fn update_yaml_file(
+    file_path: &Path,
+    content: &str,
+    selectors: &[(String, VersionSelector)],
+    next_version: &str,
+) -> Result<bool> {
+    let documents = load_yaml_documents(content)
+        .with_context(|| format!("Failed to parse YAML file `{}`.", file_path.display()))?;
+    let replacement_literal = serde_json::to_string(next_version).with_context(|| {
+        format!(
+            "Failed to serialize YAML value for `{}`.",
+            file_path.display()
+        )
+    })?;
+
+    let Some(root) = documents.first() else {
+        if let Some((selector_text, _)) = selectors.first() {
+            bail!(
+                "Selector `{selector_text}` matched no values in `{}`.",
+                file_path.display()
+            );
+        }
+        return Ok(false);
+    };
+
+    let mut replacements: BTreeMap<usize, (SourceSpan, String)> = BTreeMap::new();
+
+    for (selector_text, selector) in selectors {
+        let target_paths = resolve_yaml_paths(root, selector_text, selector, file_path)?;
+        for path in &target_paths {
+            if let Some(span) = yaml_scalar_span_at_path(
+                root,
+                content,
+                path,
+                next_version,
+                selector_text,
+                file_path,
+            )
+            .with_context(|| {
+                format!(
+                    "While updating selector `{selector_text}` in `{}`.",
+                    file_path.display()
+                )
+            })? {
+                replacements
+                    .entry(span.start)
+                    .or_insert_with(|| (span, replacement_literal.clone()));
+            }
+        }
+    }
+
+    if replacements.is_empty() {
+        return Ok(false);
+    }
+
+    let mut output = content.to_string();
+    for (_, (span, replacement)) in replacements.iter().rev() {
+        output.replace_range(span.start..span.end, replacement);
+    }
+
+    fs::write(file_path, output)
+        .with_context(|| format!("Failed to write `{}`.", file_path.display()))?;
+    Ok(true)
+}
+
+fn resolve_yaml_paths(
+    root: &MarkedYaml,
+    selector_text: &str,
+    selector: &VersionSelector,
+    file_path: &Path,
+) -> Result<Vec<Vec<PathStep>>> {
+    let mut current_paths = vec![Vec::new()];
+
+    for segment in &selector.segments {
+        let mut next_paths = BTreeSet::new();
+
+        for current_path in &current_paths {
+            let Some(node) = yaml_value_at_path(root, current_path) else {
+                continue;
+            };
+
+            let Some(child) = yaml_mapping_get(node, &segment.key) else {
+                continue;
+            };
+
+            let mut child_path = current_path.clone();
+            child_path.push(PathStep::Key(segment.key.clone()));
+
+            match &segment.qualifier {
+                None => {
+                    next_paths.insert(child_path);
+                }
+                Some(SegmentQualifier::Index(index)) => {
+                    let Some(sequence) = yaml_sequence(child) else {
+                        bail!(
+                            "Selector `{selector_text}` expects segment `{}` to be an array in `{}`.",
+                            segment.key,
+                            file_path.display()
+                        );
+                    };
+
+                    if sequence.get(*index).is_some() {
+                        let mut indexed_path = child_path;
+                        indexed_path.push(PathStep::Index(*index));
+                        next_paths.insert(indexed_path);
+                    }
+                }
+                Some(SegmentQualifier::Filter { field, value }) => {
+                    let Some(sequence) = yaml_sequence(child) else {
+                        bail!(
+                            "Selector `{selector_text}` expects segment `{}` to be an array in `{}`.",
+                            segment.key,
+                            file_path.display()
+                        );
+                    };
+
+                    for (idx, element) in sequence.iter().enumerate() {
+                        if !matches!(element.data, YamlData::Mapping(_)) {
+                            bail!(
+                                "Selector `{selector_text}` expects all elements under `{}` to be YAML mappings in `{}`.",
+                                segment.key,
+                                file_path.display()
+                            );
+                        }
+
+                        let Some(field_value) = yaml_mapping_get(element, field) else {
+                            continue;
+                        };
+
+                        let Some(actual_value) = yaml_scalar_str(field_value) else {
+                            bail!(
+                                "Selector `{selector_text}` expects filter field `{field}` to be a string in `{}`.",
+                                file_path.display()
+                            );
+                        };
+
+                        if actual_value == value {
+                            let mut indexed_path = child_path.clone();
+                            indexed_path.push(PathStep::Index(idx));
+                            next_paths.insert(indexed_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        current_paths = next_paths.into_iter().collect();
+    }
+
+    if current_paths.is_empty() {
+        bail!(
+            "Selector `{selector_text}` matched no values in `{}`.",
+            file_path.display()
+        );
+    }
+
+    Ok(current_paths)
+}
+
+fn yaml_value_at_path<'a>(root: &'a MarkedYaml, path: &[PathStep]) -> Option<&'a MarkedYaml<'a>> {
+    let mut current = root;
+    for step in path {
+        match step {
+            PathStep::Key(key) => {
+                current = yaml_mapping_get(current, key)?;
+            }
+            PathStep::Index(index) => {
+                current = yaml_sequence(current)?.get(*index)?;
+            }
+        }
+    }
+
+    Some(current)
+}
+
+fn yaml_scalar_span_at_path(
+    root: &MarkedYaml,
+    content: &str,
+    path: &[PathStep],
+    next_version: &str,
+    selector_text: &str,
+    file_path: &Path,
+) -> Result<Option<SourceSpan>> {
+    let current = yaml_value_at_path(root, path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Internal selector path resolution error for `{selector_text}` in `{}`.",
+            file_path.display()
+        )
+    })?;
+
+    let YamlData::Representation(value, style, _) = &current.data else {
+        bail!(
+            "Selector `{selector_text}` matched a non-string YAML value in `{}`.",
+            file_path.display()
+        );
+    };
+
+    if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
+        bail!(
+            "Selector `{selector_text}` matched a YAML block scalar in `{}`. Block scalar version values are not supported.",
+            file_path.display()
+        );
+    }
+
+    if value.as_ref() == next_version {
+        return Ok(None);
+    }
+
+    // saphyr records exact source spans for inline scalars (including surrounding
+    // quotes), so the span end is authoritative and needs no manual scanning. Markers
+    // are character offsets, so convert them to byte offsets before slicing.
+    let start =
+        byte_index_for_char_index(content, current.span.start.index()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not determine YAML source span for selector `{selector_text}` in `{}`.",
+                file_path.display()
+            )
+        })?;
+    let end = byte_index_for_char_index(content, current.span.end.index()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not determine YAML source span for selector `{selector_text}` in `{}`.",
+            file_path.display()
+        )
+    })?;
+
+    if end < start {
+        bail!(
+            "Could not determine YAML source span for selector `{selector_text}` in `{}`.",
+            file_path.display()
+        );
+    }
+
+    Ok(Some(SourceSpan { start, end }))
+}
+
+/// Parse every YAML document in `content`, keeping the raw scalar representation and
+/// style (via `early_parse(false)`) so block scalars can be rejected and spans map
+/// back to the original source bytes.
+fn load_yaml_documents(content: &str) -> Result<Vec<MarkedYaml<'_>>> {
+    let mut loader = YamlLoader::<MarkedYaml>::default();
+    loader.early_parse(false);
+    let mut parser = Parser::new_from_str(content);
+    parser
+        .load(&mut loader, true)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(loader.into_documents())
+}
+
+fn yaml_mapping_get<'a>(node: &'a MarkedYaml, key: &str) -> Option<&'a MarkedYaml<'a>> {
+    let YamlData::Mapping(mapping) = &node.data else {
+        return None;
+    };
+    // YAML mappings resolve duplicate keys to the last occurrence.
+    mapping
+        .iter()
+        .rev()
+        .find(|(candidate, _)| yaml_scalar_str(candidate) == Some(key))
+        .map(|(_, value)| value)
+}
+
+fn yaml_sequence<'a>(node: &'a MarkedYaml) -> Option<&'a [MarkedYaml<'a>]> {
+    match &node.data {
+        YamlData::Sequence(sequence) => Some(sequence.as_slice()),
+        _ => None,
+    }
+}
+
+fn yaml_scalar_str<'a>(node: &'a MarkedYaml) -> Option<&'a str> {
+    match &node.data {
+        YamlData::Representation(value, _, _) => Some(value.as_ref()),
+        _ => None,
+    }
+}
+
+fn byte_index_for_char_index(content: &str, character_index: usize) -> Option<usize> {
+    if character_index == content.chars().count() {
+        return Some(content.len());
+    }
+
+    content
+        .char_indices()
+        .nth(character_index)
+        .map(|(byte_index, _)| byte_index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,6 +1353,262 @@ mod tests {
     }
 
     #[test]
+    fn updates_top_level_yaml_version_without_reformatting() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        let original =
+            "# Keep this comment\nname: demo\nversion: 1.0.0 # keep inline\nprivate: true\n";
+        fs::write(&file_path, original).unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.yaml".to_string(), vec!["version".to_string()]);
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        let expected =
+            "# Keep this comment\nname: demo\nversion: \"1.1.0\" # keep inline\nprivate: true\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn updates_nested_yaml_key_without_reformatting() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(&file_path, "package:\n  name: demo\n  version: '1.0.0'\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.yaml".to_string(),
+            vec!["package.version".to_string()],
+        );
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        let expected = "package:\n  name: demo\n  version: \"1.1.0\"\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn updates_yaml_indexed_value_without_reformatting() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(
+            &file_path,
+            "packages:\n  - name: a\n    version: 1.0.0\n  - name: b\n    version: 2.0.0\n",
+        )
+        .unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.yaml".to_string(),
+            vec!["packages[1].version".to_string()],
+        );
+
+        let report =
+            apply_version_updates(temp_dir.path(), "9.9.9", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        let expected =
+            "packages:\n  - name: a\n    version: 1.0.0\n  - name: b\n    version: \"9.9.9\"\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn updates_all_yaml_filter_matches_without_reformatting() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(
+            &file_path,
+            "package:\n  - name: brel\n    version: 1.0.0\n  - name: other\n    version: 2.0.0\n  - name: brel\n    version: 3.0.0\n",
+        )
+        .unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.yaml".to_string(),
+            vec!["package[name=brel].version".to_string()],
+        );
+
+        let report =
+            apply_version_updates(temp_dir.path(), "7.7.7", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        let expected = "package:\n  - name: brel\n    version: \"7.7.7\"\n  - name: other\n    version: 2.0.0\n  - name: brel\n    version: \"7.7.7\"\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn updates_yaml_value_after_multibyte_utf8_without_corruption() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        let original =
+            "description: café release\npackage:\n  label: 🔧 tooling\n  version: 1.0.0\n";
+        fs::write(&file_path, original).unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.yaml".to_string(),
+            vec!["package.version".to_string()],
+        );
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        let expected =
+            "description: café release\npackage:\n  label: 🔧 tooling\n  version: \"1.1.0\"\n";
+        assert_eq!(fs::read_to_string(file_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn updates_entire_block_style_plain_yaml_scalar_with_flow_punctuation() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(&file_path, "version: 1,0,0\nnext: unchanged\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.yaml".to_string(), vec!["version".to_string()]);
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        assert_eq!(
+            fs::read_to_string(file_path).unwrap(),
+            "version: \"1.1.0\"\nnext: unchanged\n"
+        );
+    }
+
+    #[test]
+    fn updates_block_style_plain_yaml_scalar_with_closing_punctuation() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(&file_path, "package:\n  version: a]b}c\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.yaml".to_string(),
+            vec!["package.version".to_string()],
+        );
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        assert_eq!(
+            fs::read_to_string(file_path).unwrap(),
+            "package:\n  version: \"1.1.0\"\n"
+        );
+    }
+
+    #[test]
+    fn updates_plain_yaml_scalar_after_comment_with_unbalanced_brackets() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(&file_path, "# tracked in [release note\nversion: 1,0,0\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.yaml".to_string(), vec!["version".to_string()]);
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        assert_eq!(
+            fs::read_to_string(file_path).unwrap(),
+            "# tracked in [release note\nversion: \"1.1.0\"\n"
+        );
+    }
+
+    #[test]
+    fn updates_flow_style_plain_yaml_scalar_without_consuming_next_field() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(&file_path, "{version: 1.0.0, name: demo}\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.yaml".to_string(), vec!["version".to_string()]);
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("package.yaml")]);
+        assert_eq!(
+            fs::read_to_string(file_path).unwrap(),
+            "{version: \"1.1.0\", name: demo}\n"
+        );
+    }
+
+    #[test]
+    fn leaves_yaml_unchanged_when_value_already_matches() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        let original = "name: demo\nversion: 1.1.0\n";
+        fs::write(&file_path, original).unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.yaml".to_string(), vec!["version".to_string()]);
+
+        let report =
+            apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert!(report.changed_files.is_empty());
+        assert_eq!(fs::read_to_string(file_path).unwrap(), original);
+    }
+
+    #[test]
+    fn infers_yaml_and_yml_extensions() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(temp_dir.path().join("a.yaml"), "version: 1.0.0\n").unwrap();
+        fs::write(temp_dir.path().join("b.yml"), "version: 2.0.0\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("a.yaml".to_string(), vec!["version".to_string()]);
+        updates.insert("b.yml".to_string(), vec!["version".to_string()]);
+
+        let report =
+            apply_version_updates(temp_dir.path(), "3.0.0", &updates, &BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            report.changed_files,
+            vec![PathBuf::from("a.yaml"), PathBuf::from("b.yml")]
+        );
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("a.yaml")).unwrap(),
+            "version: \"3.0.0\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("b.yml")).unwrap(),
+            "version: \"3.0.0\"\n"
+        );
+    }
+
+    #[test]
+    fn updates_yaml_with_format_override() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("versions");
+        fs::write(&file_path, "version: 1.0.0\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("versions".to_string(), vec!["version".to_string()]);
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("versions".to_string(), VersionFileFormat::Yaml);
+
+        let report = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &overrides).unwrap();
+
+        assert_eq!(report.changed_files, vec![PathBuf::from("versions")]);
+        assert_eq!(
+            fs::read_to_string(file_path).unwrap(),
+            "version: \"1.1.0\"\n"
+        );
+    }
+
+    #[test]
     fn updates_cargo_lock_style_selector() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("Cargo.lock");
@@ -1133,6 +1680,57 @@ mod tests {
             .unwrap_err();
         let err_text = format!("{err:#}");
         assert!(err_text.contains("non-string TOML value"));
+    }
+
+    #[test]
+    fn fails_when_yaml_target_is_not_string() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(&file_path, "version:\n  major: 1\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.yaml".to_string(), vec!["version".to_string()]);
+
+        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
+            .unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("non-string YAML value"));
+    }
+
+    #[test]
+    fn fails_when_yaml_block_scalar_is_targeted() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(&file_path, "version: |-\n  1.0.0\n").unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert("package.yaml".to_string(), vec!["version".to_string()]);
+
+        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
+            .unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("YAML block scalar"));
+    }
+
+    #[test]
+    fn fails_when_yaml_filter_element_is_not_mapping() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package.yaml");
+        fs::write(
+            &file_path,
+            "package:\n  - name: brel\n    version: 1.0.0\n  - other\n",
+        )
+        .unwrap();
+
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "package.yaml".to_string(),
+            vec!["package[name=brel].version".to_string()],
+        );
+
+        let err = apply_version_updates(temp_dir.path(), "1.1.0", &updates, &BTreeMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("YAML mappings"));
     }
 
     #[test]
