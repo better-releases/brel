@@ -1,3 +1,8 @@
+## [0.11.0] - 2026-07-08
+
+### 🚀 Features
+
+- Add forgejo provider
 ## [0.10.0] - 2026-07-06
 
 ### 🚀 Features
