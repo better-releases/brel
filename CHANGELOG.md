@@ -1,3 +1,12 @@
+## [0.12.0] - 2026-07-08
+
+### 🚀 Features
+
+- Yaml support
+
+### ⚙️ Miscellaneous Tasks
+
+- Refactor into separate modules
 ## [0.11.0] - 2026-07-08
 
 ### 🚀 Features
