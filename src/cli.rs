@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use semver::Version;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,9 @@ pub struct ReleasePrArgs {
     /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Force a stable release version instead of computing a bump.
+    #[arg(long, value_parser = Version::parse)]
+    pub release_as: Option<Version>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -49,6 +53,9 @@ pub struct ChangelogArgs {
     /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Force a stable release version instead of computing a bump.
+    #[arg(long, value_parser = Version::parse)]
+    pub release_as: Option<Version>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -69,6 +76,9 @@ pub struct NextVersionArgs {
     /// Path to a config file. Defaults to brel.toml, then .brel.toml in current directory.
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Force a stable release version instead of computing a bump.
+    #[arg(long, value_parser = Version::parse)]
+    pub release_as: Option<Version>,
 }
 
 #[derive(Debug, Args, Clone)]
