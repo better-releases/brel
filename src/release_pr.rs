@@ -19,13 +19,24 @@ use std::process::Command;
 pub fn run(args: &ReleasePrArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
-    run_with_runner(&repo_root, args.config.as_deref(), &mut runner, None)
+    run_with_runner(
+        &repo_root,
+        args.config.as_deref(),
+        args.release_as.as_ref(),
+        &mut runner,
+        None,
+    )
 }
 
 pub fn run_changelog(args: &ChangelogArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
-    run_changelog_with_runner(&repo_root, args.config.as_deref(), &mut runner)
+    run_changelog_with_runner(
+        &repo_root,
+        args.config.as_deref(),
+        args.release_as.as_ref(),
+        &mut runner,
+    )
 }
 
 pub fn run_tag(args: &TagArgs) -> Result<()> {
@@ -44,12 +55,18 @@ pub fn run_tag(args: &TagArgs) -> Result<()> {
 pub fn run_next_version(args: &NextVersionArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
-    run_next_version_with_runner(&repo_root, args.config.as_deref(), &mut runner)
+    run_next_version_with_runner(
+        &repo_root,
+        args.config.as_deref(),
+        args.release_as.as_ref(),
+        &mut runner,
+    )
 }
 
 pub(crate) fn run_with_runner(
     repo_root: &Path,
     config_path: Option<&Path>,
+    release_as: Option<&Version>,
     runner: &mut dyn CommandRunner,
     auth_token_override: Option<&str>,
 ) -> Result<()> {
@@ -58,6 +75,7 @@ pub(crate) fn run_with_runner(
     run_with_runner_and_clients(
         repo_root,
         config_path,
+        release_as,
         runner,
         ProviderRuntime {
             auth_token_override,
@@ -73,6 +91,7 @@ pub(crate) fn run_with_runner(
 fn run_with_runner_and_gitlab_client(
     repo_root: &Path,
     config_path: Option<&Path>,
+    release_as: Option<&Version>,
     runner: &mut dyn CommandRunner,
     auth_token_override: Option<&str>,
     gitlab_env_override: Option<GitlabEnv>,
@@ -82,6 +101,7 @@ fn run_with_runner_and_gitlab_client(
     run_with_runner_and_clients(
         repo_root,
         config_path,
+        release_as,
         runner,
         ProviderRuntime {
             auth_token_override,
@@ -104,6 +124,7 @@ struct ProviderRuntime<'client, 'token> {
 fn run_with_runner_and_clients(
     repo_root: &Path,
     config_path: Option<&Path>,
+    release_as: Option<&Version>,
     runner: &mut dyn CommandRunner,
     runtime: ProviderRuntime<'_, '_>,
 ) -> Result<()> {
@@ -112,10 +133,19 @@ fn run_with_runner_and_clients(
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
 
-    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template)? else {
+    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template, release_as)?
+    else {
         println!("No releasable commits found. Skipping release PR.");
         return Ok(());
     };
+
+    let forced_message = next_release
+        .forced_by
+        .as_ref()
+        .map(|source| source.message(&next_release.next_version));
+    if let Some(message) = &forced_message {
+        println!("{message}");
+    }
 
     if config.release_pr.version_updates.is_empty() {
         println!("No `release_pr.version_updates` configured. Nothing to update.");
@@ -281,7 +311,7 @@ fn render_release_pr_body(
             subject: commit.subject.trim(),
         })
         .collect::<Vec<_>>();
-    template::render_release_pr_body(
+    let mut pr_body = template::render_release_pr_body(
         &ReleasePrBodyContext {
             version: next_version,
             tag: next_tag,
@@ -290,18 +320,29 @@ fn render_release_pr_body(
             commits: &commit_contexts,
         },
         template_override.as_deref(),
-    )
+    )?;
+    if template_override.is_none()
+        && let Some(source) = &next_release.forced_by
+    {
+        pr_body.push('\n');
+        pr_body.push_str(&source.message(&next_release.next_version));
+        pr_body.push('\n');
+    }
+
+    Ok(pr_body)
 }
 
 pub(crate) fn run_next_version_with_runner(
     repo_root: &Path,
     config_path: Option<&Path>,
+    release_as: Option<&Version>,
     runner: &mut dyn CommandRunner,
 ) -> Result<()> {
     let config = load_config(config_path, repo_root)?;
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
-    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template)? else {
+    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template, release_as)?
+    else {
         return Ok(());
     };
 
@@ -312,6 +353,7 @@ pub(crate) fn run_next_version_with_runner(
 pub(crate) fn run_changelog_with_runner(
     repo_root: &Path,
     config_path: Option<&Path>,
+    release_as: Option<&Version>,
     runner: &mut dyn CommandRunner,
 ) -> Result<()> {
     let config = load_config(config_path, repo_root)?;
@@ -322,10 +364,15 @@ pub(crate) fn run_changelog_with_runner(
 
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
-    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template)? else {
+    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template, release_as)?
+    else {
         println!("No releasable commits found. Skipping changelog.");
         return Ok(());
     };
+
+    if let Some(source) = &next_release.forced_by {
+        println!("{}", source.message(&next_release.next_version));
+    }
 
     let next_version_string = next_release.next_version.to_string();
     let next_tag = tag_template.render(&next_version_string);
@@ -694,12 +741,31 @@ struct TaggedVersion {
 struct NextRelease {
     next_version: Version,
     commits: Vec<CommitInfo>,
+    forced_by: Option<ForcedBy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForcedBy {
+    Footer(String),
+    Flag,
+}
+
+impl ForcedBy {
+    fn message(&self, version: &Version) -> String {
+        match self {
+            Self::Footer(sha) => {
+                format!("Version {version} forced by Release-As footer in {sha}.")
+            }
+            Self::Flag => format!("Version {version} forced by --release-as flag."),
+        }
+    }
 }
 
 fn resolve_next_release(
     runner: &mut dyn CommandRunner,
     repo_root: &Path,
     tag_template: &TagTemplate,
+    release_as: Option<&Version>,
 ) -> Result<Option<NextRelease>> {
     let latest_tag = find_latest_release_tag(runner, repo_root, tag_template)?;
     let commits = collect_commits_since(
@@ -707,6 +773,21 @@ fn resolve_next_release(
         repo_root,
         latest_tag.as_ref().map(|tag| tag.raw.as_str()),
     )?;
+
+    let override_version = match release_as {
+        Some(version) => Some((version.clone(), ForcedBy::Flag)),
+        None => find_release_as_override(&commits)?
+            .map(|(version, sha)| (version, ForcedBy::Footer(sha))),
+    };
+    if let Some((forced, source)) = override_version {
+        validate_forced_version(&forced, latest_tag.as_ref(), &source)?;
+        return Ok(Some(NextRelease {
+            next_version: forced,
+            commits,
+            forced_by: Some(source),
+        }));
+    }
+
     let Some(next_bump) = highest_bump(commits.iter()) else {
         return Ok(None);
     };
@@ -718,7 +799,36 @@ fn resolve_next_release(
     Ok(Some(NextRelease {
         next_version: bump_version(&base_version, next_bump),
         commits,
+        forced_by: None,
     }))
+}
+
+fn validate_forced_version(
+    forced: &Version,
+    latest_tag: Option<&TaggedVersion>,
+    source: &ForcedBy,
+) -> Result<()> {
+    if !forced.pre.is_empty() || !forced.build.is_empty() {
+        match source {
+            ForcedBy::Footer(sha) => bail!(
+                "Release-As: {forced} in {sha} is not supported yet; only stable versions can be forced."
+            ),
+            ForcedBy::Flag => bail!(
+                "--release-as {forced} is not supported yet; only stable versions can be forced."
+            ),
+        }
+    }
+
+    if let Some(latest_tag) = latest_tag
+        && forced <= &latest_tag.version
+    {
+        bail!(
+            "Release-As version {forced} is not greater than the latest release tag {}.",
+            latest_tag.raw
+        );
+    }
+
+    Ok(())
 }
 
 fn find_latest_release_tag(
@@ -842,6 +952,36 @@ fn classify_commit(commit: &CommitInfo) -> Option<BumpLevel> {
         return Some(BumpLevel::Patch);
     }
     None
+}
+
+fn find_release_as_override(commits: &[CommitInfo]) -> Result<Option<(Version, String)>> {
+    for commit in commits {
+        let body_lines = commit.body.lines().collect::<Vec<_>>();
+        let trailer_start = body_lines
+            .iter()
+            .rposition(|line| line.trim().is_empty())
+            .map_or(0, |index| index + 1);
+
+        for line in &body_lines[trailer_start..] {
+            let Some((key, value)) = line.trim_start().split_once(':') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("release-as") {
+                continue;
+            }
+
+            let value = value.trim();
+            let version = Version::parse(value).with_context(|| {
+                format!(
+                    "Invalid Release-As version `{value}` in commit {}.",
+                    short_sha(&commit.sha)
+                )
+            })?;
+            return Ok(Some((version, short_sha(&commit.sha).to_string())));
+        }
+    }
+
+    Ok(None)
 }
 
 fn has_breaking_change(commit: &CommitInfo) -> bool {
@@ -1453,13 +1593,14 @@ mod tests {
         ]);
         let template = TagTemplate::parse("v{version}").unwrap();
 
-        let release = resolve_next_release(&mut runner, temp_dir.path(), &template)
+        let release = resolve_next_release(&mut runner, temp_dir.path(), &template, None)
             .unwrap()
             .expect("expected releasable version");
 
         assert_eq!(release.next_version, Version::new(1, 3, 0));
         assert_eq!(release.commits.len(), 1);
         assert_eq!(release.commits[0].subject, "feat: add feature");
+        assert_eq!(release.forced_by, None);
     }
 
     #[test]
@@ -1471,8 +1612,209 @@ mod tests {
         ]);
         let template = TagTemplate::parse("v{version}").unwrap();
 
-        let release = resolve_next_release(&mut runner, temp_dir.path(), &template).unwrap();
+        let release = resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap();
         assert!(release.is_none());
+    }
+
+    #[test]
+    fn release_as_footer_parsing_is_tolerant_and_uses_first_match() {
+        let commits = vec![
+            CommitInfo {
+                sha: "ignored123456".to_string(),
+                subject: "chore: no override".to_string(),
+                body: "Release notes only".to_string(),
+            },
+            CommitInfo {
+                sha: "abc123456789".to_string(),
+                subject: "chore: force release".to_string(),
+                body: "  ReLeAsE-As :  1.4.0  \nRelease-As: 2.0.0".to_string(),
+            },
+        ];
+
+        let override_version = find_release_as_override(&commits).unwrap();
+
+        assert_eq!(
+            override_version,
+            Some((Version::new(1, 4, 0), "abc1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn release_as_like_text_outside_final_trailer_block_is_ignored() {
+        let commits = vec![CommitInfo {
+            sha: "abc123456789".to_string(),
+            subject: "docs: explain release override".to_string(),
+            body:
+                "Release-As: <version> selects a version.\n\nSigned-off-by: Dev <dev@example.com>"
+                    .to_string(),
+        }];
+
+        let override_version = find_release_as_override(&commits).unwrap();
+
+        assert_eq!(override_version, None);
+    }
+
+    #[test]
+    fn release_as_parser_only_validates_the_final_trailer_block() {
+        let commits = vec![CommitInfo {
+            sha: "abc123456789".to_string(),
+            subject: "docs: explain release override".to_string(),
+            body: "Release-As: https://example.com is documentation.\n\nRelease-As: 1.6.0"
+                .to_string(),
+        }];
+
+        let override_version = find_release_as_override(&commits).unwrap();
+
+        assert_eq!(
+            override_version,
+            Some((Version::new(1, 6, 0), "abc1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn release_as_footer_forces_release_and_newest_commit_wins() {
+        let temp_dir = tempdir().unwrap();
+        let commits = format!(
+            "{}{}",
+            log_entry(
+                "newest123456",
+                "chore: newest override",
+                "Release-As: 1.8.0"
+            ),
+            log_entry("older1234567", "feat: older override", "Release-As: 1.7.0")
+        );
+        let mut runner = ScriptedRunner::new(vec![ok("v1.2.3\n"), ok(&commits)]);
+        let template = TagTemplate::parse("v{version}").unwrap();
+
+        let release = resolve_next_release(&mut runner, temp_dir.path(), &template, None)
+            .unwrap()
+            .expect("footer should force a release");
+
+        assert_eq!(release.next_version, Version::new(1, 8, 0));
+        assert_eq!(
+            release.forced_by,
+            Some(ForcedBy::Footer("newest1".to_string()))
+        );
+    }
+
+    #[test]
+    fn release_as_flag_takes_precedence_over_footer() {
+        let temp_dir = tempdir().unwrap();
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry(
+                "abc123456789",
+                "chore: force release",
+                "Release-As: 1.5.0",
+            )),
+        ]);
+        let template = TagTemplate::parse("v{version}").unwrap();
+        let flag_version = Version::new(2, 0, 0);
+
+        let release =
+            resolve_next_release(&mut runner, temp_dir.path(), &template, Some(&flag_version))
+                .unwrap()
+                .expect("flag should force a release");
+
+        assert_eq!(release.next_version, flag_version);
+        assert_eq!(release.forced_by, Some(ForcedBy::Flag));
+    }
+
+    #[test]
+    fn release_as_footer_rejects_non_monotonic_version() {
+        let temp_dir = tempdir().unwrap();
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry(
+                "abc123456789",
+                "chore: force release",
+                "Release-As: 1.2.3",
+            )),
+        ]);
+        let template = TagTemplate::parse("v{version}").unwrap();
+
+        let err = resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Release-As version 1.2.3 is not greater than the latest release tag v1.2.3."
+        );
+    }
+
+    #[test]
+    fn release_as_footer_rejects_malformed_version_with_commit() {
+        let temp_dir = tempdir().unwrap();
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry(
+                "abc123456789",
+                "chore: force release",
+                "Release-As: v2.0",
+            )),
+        ]);
+        let template = TagTemplate::parse("v{version}").unwrap();
+
+        let err = resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("Invalid Release-As version `v2.0` in commit abc1234."));
+    }
+
+    #[test]
+    fn release_as_footer_rejects_prerelease_and_build_metadata() {
+        for forced in ["2.0.0-rc.1", "2.0.0+build.1"] {
+            let temp_dir = tempdir().unwrap();
+            let mut runner = ScriptedRunner::new(vec![
+                ok("v1.2.3\n"),
+                ok(&log_entry(
+                    "abc123456789",
+                    "chore: force release",
+                    &format!("Release-As: {forced}"),
+                )),
+            ]);
+            let template = TagTemplate::parse("v{version}").unwrap();
+
+            let err =
+                resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Release-As: {forced} in abc1234 is not supported yet; only stable versions can be forced."
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn release_as_flag_reuses_stable_and_monotonic_validation() {
+        let template = TagTemplate::parse("v{version}").unwrap();
+        for (forced, expected) in [
+            (
+                "1.2.3",
+                "Release-As version 1.2.3 is not greater than the latest release tag v1.2.3.",
+            ),
+            (
+                "2.0.0-rc.1",
+                "--release-as 2.0.0-rc.1 is not supported yet; only stable versions can be forced.",
+            ),
+            (
+                "2.0.0+build.1",
+                "--release-as 2.0.0+build.1 is not supported yet; only stable versions can be forced.",
+            ),
+        ] {
+            let temp_dir = tempdir().unwrap();
+            let mut runner = ScriptedRunner::new(vec![
+                ok("v1.2.3\n"),
+                ok(&log_entry("abc123456789", "chore: no release", "")),
+            ]);
+            let forced = Version::parse(forced).unwrap();
+
+            let err = resolve_next_release(&mut runner, temp_dir.path(), &template, Some(&forced))
+                .unwrap_err();
+
+            assert_eq!(err.to_string(), expected);
+        }
     }
 
     #[test]
@@ -1496,7 +1838,7 @@ mod tests {
             )),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
         assert_eq!(runner.calls.len(), 2);
         assert!(runner.calls.iter().all(|call| call.program == "git"));
     }
@@ -1536,7 +1878,7 @@ default_branch = "main"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
 
         assert!(runner.calls.iter().any(|call| call.program == "git"
             && call.args
@@ -1590,7 +1932,7 @@ default_branch = "main"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
 
         assert!(runner.calls.iter().any(|call| call.program == "git"
             && call.args
@@ -1679,7 +2021,8 @@ default_branch = "main"
             err_status(1, "create failed"),
         ]);
 
-        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap_err();
+        let err =
+            run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap_err();
         let err_text = format!("{err:#}");
         assert!(err_text.contains("Failed to create release pull request."));
         assert!(
@@ -1736,7 +2079,7 @@ default_branch = "main"
             err_status(1, "remote ref does not exist"),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
 
         assert!(
             runner
@@ -1791,7 +2134,8 @@ default_branch = "main"
             ok(""),
         ]);
 
-        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap_err();
+        let err =
+            run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap_err();
         let err_text = format!("{err:#}");
         assert!(err_text.contains("Failed to close 1 stale release pull request"));
         assert!(err_text.contains("brel/release/v1.2.4"));
@@ -1858,7 +2202,7 @@ default_branch = "main"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
 
         let edit_idx = call_position(&runner.calls, |call| {
             call.program == "gh" && args_start_with(&call.args, &["pr", "edit", "8"])
@@ -1914,7 +2258,7 @@ tag_template = "{version}"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
 
         assert!(runner.calls.iter().any(|call| {
             call.program == "git"
@@ -2379,7 +2723,7 @@ version = "1.2.3"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
 
         let lock_contents = fs::read_to_string(temp_dir.path().join("Cargo.lock")).unwrap();
         assert!(lock_contents.contains("name = \"dep\"\nversion = \"0.9.0\""));
@@ -2428,7 +2772,7 @@ packages:
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
 
         let contents = fs::read_to_string(temp_dir.path().join("release.yaml")).unwrap();
         assert!(contents.contains("name: dep\n    version: 0.9.0"));
@@ -2464,8 +2808,55 @@ packages:
             ok(&log_entry("abc123456789", "fix: patch", "")),
         ]);
 
-        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("")).unwrap_err();
+        let err = run_with_runner(temp_dir.path(), None, None, &mut runner, Some("")).unwrap_err();
         assert!(err.to_string().contains("Missing GitHub auth token"));
+    }
+
+    #[test]
+    fn default_pr_body_reports_release_as_footer_source() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            r#"
+[release_pr.version_updates]
+"package.json" = ["version"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.2.3" }"#,
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.3\n"),
+            ok(&log_entry(
+                "abc123456789",
+                "chore: force release",
+                "Release-As: 2.0.0",
+            )),
+            ok("[]"),
+            ok(""),
+            ok(""),
+            status(1),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
+
+        let body = runner
+            .calls
+            .iter()
+            .find(|call| call.program == "gh" && call.args.contains(&"--body".to_string()))
+            .and_then(|call| {
+                let body_index = call.args.iter().position(|arg| arg == "--body")?;
+                call.args.get(body_index + 1)
+            })
+            .expect("release PR body");
+        assert!(body.contains("Version 2.0.0 forced by Release-As footer in abc1234."));
     }
 
     #[test]
@@ -2498,7 +2889,11 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
 
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
-            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok(&log_entry(
+                "abc123456789",
+                "chore: force release",
+                "Release-As: 1.5.0",
+            )),
             ok("[]"),
             ok(""),
             ok(""),
@@ -2508,15 +2903,18 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
-        assert!(runner.calls.iter().any(|call| {
-            call.program == "gh"
-                && call.args.contains(&"--body".to_string())
-                && call
-                    .args
-                    .iter()
-                    .any(|arg| arg.contains("Version 1.3.0 from main"))
-        }));
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
+        let body = runner
+            .calls
+            .iter()
+            .find(|call| call.program == "gh" && call.args.contains(&"--body".to_string()))
+            .and_then(|call| {
+                let body_index = call.args.iter().position(|arg| arg == "--body")?;
+                call.args.get(body_index + 1)
+            })
+            .expect("release PR body");
+        assert!(body.contains("Version 1.5.0 from main"));
+        assert!(!body.contains("forced by Release-As"));
     }
 
     #[test]
@@ -2556,7 +2954,8 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
             ok(""),
         ]);
 
-        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap_err();
+        let err =
+            run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap_err();
         assert!(err.to_string().contains("Failed to register template"));
     }
 
@@ -2589,7 +2988,7 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap();
         assert!(runner.calls.iter().any(|call| {
             call.program == "git"
                 && call.args
@@ -2624,7 +3023,8 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
             err_status(127, "gh: command not found"),
         ]);
 
-        let err = run_with_runner(temp_dir.path(), None, &mut runner, Some("token")).unwrap_err();
+        let err =
+            run_with_runner(temp_dir.path(), None, None, &mut runner, Some("token")).unwrap_err();
         let err_text = format!("{err:#}");
         assert!(err_text.contains("Failed to list open pull requests via gh."));
         assert!(err_text.contains("gh pr list"));
@@ -2659,7 +3059,7 @@ pr_template_file = ".github/brel/release-pr-body.hbs"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("abc-token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("abc-token")).unwrap();
 
         let gh_calls = runner
             .calls
@@ -2707,6 +3107,7 @@ default_branch = "main"
 
         run_with_runner_and_gitlab_client(
             temp_dir.path(),
+            None,
             None,
             &mut runner,
             Some("token"),
@@ -2778,6 +3179,7 @@ default_branch = "main"
         run_with_runner_and_gitlab_client(
             temp_dir.path(),
             None,
+            None,
             &mut runner,
             Some("token"),
             Some(gitlab_env()),
@@ -2843,6 +3245,7 @@ default_branch = "main"
 
         run_with_runner_and_gitlab_client(
             temp_dir.path(),
+            None,
             None,
             &mut runner,
             Some("token"),
@@ -2917,6 +3320,7 @@ default_branch = "main"
 
         run_with_runner_and_clients(
             temp_dir.path(),
+            None,
             None,
             &mut runner,
             ProviderRuntime {
@@ -2996,6 +3400,7 @@ default_branch = "main"
         run_with_runner_and_clients(
             temp_dir.path(),
             None,
+            None,
             &mut runner,
             ProviderRuntime {
                 auth_token_override: Some("token"),
@@ -3066,6 +3471,7 @@ default_branch = "main"
 
         run_with_runner_and_clients(
             temp_dir.path(),
+            None,
             None,
             &mut runner,
             ProviderRuntime {
@@ -3138,6 +3544,7 @@ provider = "forgejo"
         let err = run_with_runner_and_clients(
             temp_dir.path(),
             None,
+            None,
             &mut runner,
             ProviderRuntime {
                 auth_token_override: Some(""),
@@ -3182,6 +3589,7 @@ provider = "forgejo"
 
         let err = run_with_runner_and_clients(
             temp_dir.path(),
+            None,
             None,
             &mut runner,
             ProviderRuntime {
@@ -3228,6 +3636,7 @@ provider = "gitlab"
         let err = run_with_runner_and_gitlab_client(
             temp_dir.path(),
             None,
+            None,
             &mut runner,
             Some(""),
             Some(gitlab_env()),
@@ -3269,7 +3678,7 @@ provider = "gitlab"
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("abc-token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("abc-token")).unwrap();
 
         let add_call = runner
             .calls
@@ -3314,7 +3723,7 @@ enabled = false
             ok(""),
         ]);
 
-        run_with_runner(temp_dir.path(), None, &mut runner, Some("abc-token")).unwrap();
+        run_with_runner(temp_dir.path(), None, None, &mut runner, Some("abc-token")).unwrap();
 
         let add_call = runner
             .calls

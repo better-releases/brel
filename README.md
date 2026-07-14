@@ -153,6 +153,33 @@ When you run `brel release-pr`:
    - patch: `fix: ...`
 5. If no releasable commits are found, it exits successfully with no changes.
 
+To override that calculation for one release, add a `Release-As: <version>`
+trailer to a commit in the release range:
+
+```text
+chore: prepare the 1.0 release
+
+Release-As: 1.0.0
+```
+
+The trailer forces a release even if the range contains no `feat`, `fix`, or
+breaking-change commits. If several commits have a `Release-As` trailer, the
+newest commit wins. The override expires automatically after that commit is
+included in a release tag, because subsequent runs scan only commits after the
+tag.
+
+Manual runs can override the footer with `--release-as <version>` on
+`brel release-pr`, `brel next-version`, or `brel changelog`. The command-line
+flag takes precedence over any footer. For example,
+`brel next-version --release-as 1.0.0` validates an override and prints the
+result without preparing a release PR or changelog.
+
+Forced versions must be stable SemVer values without prerelease or build
+metadata, and must be greater than the latest matching release tag. Malformed,
+unsupported, or non-increasing overrides are errors rather than being ignored.
+When `release-pr` uses an override, it reports the source in its output and in
+the default release PR body. Custom PR body templates are left unchanged.
+
 `brel next-version` uses the same versioning rules:
 
 - when releasable commits exist, it prints the next version (for example `1.2.3`)

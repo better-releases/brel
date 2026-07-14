@@ -72,6 +72,140 @@ fn next_version_prints_nothing_when_no_releasable_commits_exist() {
 }
 
 #[test]
+fn next_version_release_as_flag_forces_version_without_releasable_commits() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join("notes.txt"), "docs").unwrap();
+    run_git(temp_dir.path(), &["add", "notes.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "chore: add notes"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["next-version", "--release-as", "1.0.0"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("1.0.0\n"));
+}
+
+#[test]
+fn next_version_release_as_footer_forces_version_without_releasable_commits() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join("notes.txt"), "docs").unwrap();
+    run_git(temp_dir.path(), &["add", "notes.txt"]);
+    run_git(
+        temp_dir.path(),
+        &[
+            "commit",
+            "-m",
+            "chore: add notes",
+            "-m",
+            "Release-As: 1.0.0",
+        ],
+    );
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("1.0.0\n"));
+}
+
+#[test]
+fn release_as_footer_expires_after_its_release_is_tagged() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join("notes.txt"), "docs").unwrap();
+    run_git(temp_dir.path(), &["add", "notes.txt"]);
+    run_git(
+        temp_dir.path(),
+        &[
+            "commit",
+            "-m",
+            "chore: force release",
+            "-m",
+            "Release-As: 1.0.0",
+        ],
+    );
+    run_git(temp_dir.path(), &["tag", "v1.0.0"]);
+
+    fs::write(temp_dir.path().join("fix.txt"), "fix").unwrap();
+    run_git(temp_dir.path(), &["add", "fix.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "fix: patch bug"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("1.0.1\n"));
+}
+
+#[test]
+fn release_as_like_text_before_trailer_block_does_not_override_version() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join("fix.txt"), "fix").unwrap();
+    run_git(temp_dir.path(), &["add", "fix.txt"]);
+    run_git(
+        temp_dir.path(),
+        &[
+            "commit",
+            "-m",
+            "fix: document release override",
+            "-m",
+            "Release-As: <version> is documented here.",
+            "-m",
+            "Signed-off-by: Dev <dev@example.com>",
+        ],
+    );
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("0.0.1\n"));
+}
+
+#[test]
+fn release_as_flag_rejects_malformed_semver_as_cli_usage_error() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.args(["next-version", "--release-as", "v1.0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value 'v1.0'"))
+        .stderr(predicate::str::contains("--release-as"));
+}
+
+#[test]
+fn release_pr_release_as_flag_reaches_shared_resolver() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join("notes.txt"), "docs").unwrap();
+    run_git(temp_dir.path(), &["add", "notes.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "chore: add notes"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["release-pr", "--release-as", "1.0.0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Version 1.0.0 forced by --release-as flag.",
+        ))
+        .stdout(predicate::str::contains(
+            "No `release_pr.version_updates` configured. Nothing to update.",
+        ));
+}
+
+#[test]
 fn next_version_uses_configured_tag_template_for_baseline_detection() {
     let temp_dir = tempdir().unwrap();
     init_git_repo(temp_dir.path());
@@ -193,6 +327,74 @@ fn changelog_git_cliff_provider_runs_expected_command() {
         fs::read_to_string(args_file).unwrap(),
         "--config\ncliff.toml\n--unreleased\n--tag\nv0.1.0\n--prepend\nCHANGELOG.md\n"
     );
+}
+
+#[test]
+fn changelog_release_as_flag_forces_provider_version() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+    fs::write(temp_dir.path().join("notes.txt"), "docs").unwrap();
+    run_git(temp_dir.path(), &["add", "notes.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "chore: add notes"]);
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_command(
+        &bin_dir.join("git-cliff"),
+        r#"printf '%s\n' "$@" > "$BREL_FAKE_ARGS""#,
+    );
+    let args_file = temp_dir.path().join("git-cliff.args");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["changelog", "--release-as", "1.0.0"])
+        .env("PATH", prepend_path(&bin_dir))
+        .env("BREL_FAKE_ARGS", &args_file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Version 1.0.0 forced by --release-as flag.",
+        ))
+        .stdout(predicate::str::contains(
+            "Generated changelog for tag v1.0.0.",
+        ));
+
+    assert!(fs::read_to_string(args_file).unwrap().contains("v1.0.0"));
+}
+
+#[test]
+fn changelog_reports_release_as_footer_source() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+    fs::write(temp_dir.path().join("notes.txt"), "docs").unwrap();
+    run_git(temp_dir.path(), &["add", "notes.txt"]);
+    run_git(
+        temp_dir.path(),
+        &[
+            "commit",
+            "-m",
+            "chore: add notes",
+            "-m",
+            "Release-As: 1.0.0",
+        ],
+    );
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_command(&bin_dir.join("git-cliff"), "exit 0");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("changelog")
+        .env("PATH", prepend_path(&bin_dir))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Version 1.0.0 forced by Release-As footer in ",
+        ))
+        .stdout(predicate::str::contains(
+            "Generated changelog for tag v1.0.0.",
+        ));
 }
 
 #[test]
