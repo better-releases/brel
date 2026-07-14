@@ -4,11 +4,14 @@ pre-commit:
     - name: rustfmt
       run: cargo fmt --all -- --check
       stage_fixed: true
+      glob: "*.rs"
 
     - name: clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy -- -D warnings -D clippy::pedantic -D clippy::perf -D clippy::suspicious
       stage_fixed: true
+      glob: "*.rs"
 
     - name: cargo-check
       run: cargo check --all-targets --all-features
       stage_fixed: true
+      glob: "*.rs"
