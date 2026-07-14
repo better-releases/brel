@@ -443,8 +443,38 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         return Ok(ReleasePrConfig::default());
     };
 
+    let RawReleasePrConfig {
+        version_updates,
+        format_overrides,
+        release_branch_pattern,
+        pr_template_file,
+        commit_author,
+        changelog,
+        tagging,
+    } = raw_release_pr;
+    let version_updates = resolve_version_updates(version_updates)?;
+    let format_overrides = resolve_format_overrides(format_overrides, &version_updates)?;
+    let release_branch_pattern = resolve_release_branch_pattern(release_branch_pattern)?;
+    let pr_template_file = pr_template_file
+        .map(|path| normalize_repo_relative_path(&path, "`release_pr.pr_template_file` path"))
+        .transpose()?;
+
+    Ok(ReleasePrConfig {
+        version_updates,
+        format_overrides,
+        release_branch_pattern,
+        pr_template_file,
+        commit_author: resolve_commit_author(commit_author)?,
+        changelog: resolve_changelog_config(changelog)?,
+        tagging: resolve_tagging_config(tagging)?,
+    })
+}
+
+fn resolve_version_updates(
+    raw: Option<BTreeMap<String, Vec<String>>>,
+) -> Result<BTreeMap<String, Vec<String>>> {
     let mut version_updates = BTreeMap::new();
-    for (path, keys) in raw_release_pr.version_updates.unwrap_or_default() {
+    for (path, keys) in raw.unwrap_or_default() {
         let normalized_path =
             normalize_repo_relative_path(&path, "`release_pr.version_updates` path")?;
         if keys.is_empty() {
@@ -464,8 +494,15 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         }
     }
 
+    Ok(version_updates)
+}
+
+fn resolve_format_overrides(
+    raw: Option<BTreeMap<String, String>>,
+    version_updates: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, VersionFileFormat>> {
     let mut format_overrides = BTreeMap::new();
-    for (path, format_value) in raw_release_pr.format_overrides.unwrap_or_default() {
+    for (path, format_value) in raw.unwrap_or_default() {
         let normalized_path =
             normalize_repo_relative_path(&path, "`release_pr.format_overrides` path")?;
         if !version_updates.contains_key(&normalized_path) {
@@ -484,8 +521,11 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         }
     }
 
-    let release_branch_pattern = raw_release_pr
-        .release_branch_pattern
+    Ok(format_overrides)
+}
+
+fn resolve_release_branch_pattern(raw: Option<String>) -> Result<String> {
+    let release_branch_pattern = raw
         .unwrap_or_else(|| DEFAULT_RELEASE_BRANCH_PATTERN.to_string())
         .trim()
         .to_string();
@@ -494,16 +534,11 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
     }
     validate_branch_pattern(&release_branch_pattern)?;
 
-    let pr_template_file = match raw_release_pr.pr_template_file {
-        Some(path) => {
-            let normalized =
-                normalize_repo_relative_path(&path, "`release_pr.pr_template_file` path")?;
-            Some(normalized)
-        }
-        None => None,
-    };
+    Ok(release_branch_pattern)
+}
 
-    let raw_author = raw_release_pr.commit_author.unwrap_or_default();
+fn resolve_commit_author(raw: Option<RawCommitAuthorConfig>) -> Result<CommitAuthorConfig> {
+    let raw_author = raw.unwrap_or_default();
     let commit_author_name = raw_author
         .name
         .unwrap_or_else(|| DEFAULT_COMMIT_AUTHOR_NAME.to_string())
@@ -522,7 +557,14 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         bail!("`release_pr.commit_author.email` cannot be empty.");
     }
 
-    let raw_changelog = raw_release_pr.changelog.unwrap_or_default();
+    Ok(CommitAuthorConfig {
+        name: commit_author_name,
+        email: commit_author_email,
+    })
+}
+
+fn resolve_changelog_config(raw: Option<RawChangelogConfig>) -> Result<ChangelogConfig> {
+    let raw_changelog = raw.unwrap_or_default();
     let changelog_enabled = raw_changelog.enabled.unwrap_or(true);
     let changelog_provider = raw_changelog
         .provider
@@ -544,7 +586,19 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         }
         ChangelogProvider::GitCliff => DEFAULT_CHANGELOGEN_VERSION.to_string(),
     };
-    let raw_tagging = raw_release_pr.tagging.unwrap_or_default();
+
+    Ok(ChangelogConfig {
+        enabled: changelog_enabled,
+        provider: changelog_provider,
+        output_file: changelog_output_file,
+        changelogen: ChangelogenConfig {
+            version: changelogen_version,
+        },
+    })
+}
+
+fn resolve_tagging_config(raw: Option<RawTaggingConfig>) -> Result<TaggingConfig> {
+    let raw_tagging = raw.unwrap_or_default();
     let tagging_enabled = raw_tagging.enabled.unwrap_or(DEFAULT_TAGGING_ENABLED);
     let tag_template = tag_template::normalize_tag_template(
         raw_tagging
@@ -554,27 +608,9 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
     )
     .context("Invalid `release_pr.tagging.tag_template`.")?;
 
-    Ok(ReleasePrConfig {
-        version_updates,
-        format_overrides,
-        release_branch_pattern,
-        pr_template_file,
-        commit_author: CommitAuthorConfig {
-            name: commit_author_name,
-            email: commit_author_email,
-        },
-        changelog: ChangelogConfig {
-            enabled: changelog_enabled,
-            provider: changelog_provider,
-            output_file: changelog_output_file,
-            changelogen: ChangelogenConfig {
-                version: changelogen_version,
-            },
-        },
-        tagging: TaggingConfig {
-            enabled: tagging_enabled,
-            tag_template,
-        },
+    Ok(TaggingConfig {
+        enabled: tagging_enabled,
+        tag_template,
     })
 }
 
@@ -591,8 +627,7 @@ fn normalize_repo_relative_path(value: &str, label: &str) -> Result<String> {
 
     for component in path.components() {
         match component {
-            Component::CurDir => {}
-            Component::Normal(_) => {}
+            Component::CurDir | Component::Normal(_) => {}
             Component::ParentDir => {
                 bail!("{label} `{trimmed}` cannot contain `..`.");
             }
@@ -613,8 +648,7 @@ fn normalize_changelogen_version(value: Option<&str>) -> Result<String> {
 
     if Version::parse(trimmed).is_err() {
         bail!(
-            "`release_pr.changelog.changelogen.version` must be a SemVer version like `{}`.",
-            DEFAULT_CHANGELOGEN_VERSION
+            "`release_pr.changelog.changelogen.version` must be a SemVer version like `{DEFAULT_CHANGELOGEN_VERSION}`."
         );
     }
 

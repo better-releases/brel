@@ -393,8 +393,10 @@ pub(crate) fn resolve_gitlab_tag_request(
         let target = target_arg
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| env.commit_sha.clone().expect("tag env includes commit sha"));
+            .map_or_else(
+                || env.commit_sha.clone().expect("tag env includes commit sha"),
+                str::to_string,
+            );
 
         return Ok(Some(TagRequest {
             tag: tag.to_string(),

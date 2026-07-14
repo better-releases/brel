@@ -424,7 +424,7 @@ fn detect_file_format(
     match Path::new(relative_path)
         .extension()
         .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .as_deref()
     {
         Some("json") => Ok(VersionFileFormat::Json),

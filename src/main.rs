@@ -25,10 +25,10 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init(args) => init::run(args),
-        Commands::Changelog(args) => release_pr::run_changelog(args),
-        Commands::ReleasePr(args) => release_pr::run(args),
-        Commands::Tag(args) => release_pr::run_tag(args),
-        Commands::NextVersion(args) => release_pr::run_next_version(args),
-        Commands::Validate(args) => validate::run(args),
+        Commands::Changelog(args) => release_pr::run_changelog(&args),
+        Commands::ReleasePr(args) => release_pr::run(&args),
+        Commands::Tag(args) => release_pr::run_tag(&args),
+        Commands::NextVersion(args) => release_pr::run_next_version(&args),
+        Commands::Validate(args) => validate::run(&args),
     }
 }

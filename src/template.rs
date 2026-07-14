@@ -30,10 +30,8 @@ struct GithubWorkflowRenderContext<'a> {
     pub tag_command: &'a str,
     pub github_token_expr: &'a str,
     pub tagging_push_token_expr: &'a str,
-    pub changelog_enabled: bool,
-    pub changelog_provider_git_cliff: bool,
-    pub changelog_provider_changelogen: bool,
-    pub tagging_enabled: bool,
+    #[serde(flatten)]
+    pub flags: WorkflowRenderFlags,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,10 +41,8 @@ struct GitlabWorkflowRenderContext<'a> {
     pub changelog_command: &'a str,
     pub tag_command: &'a str,
     pub brel_version: &'a str,
-    pub changelog_enabled: bool,
-    pub changelog_provider_git_cliff: bool,
-    pub changelog_provider_changelogen: bool,
-    pub tagging_enabled: bool,
+    #[serde(flatten)]
+    pub flags: WorkflowRenderFlags,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,10 +54,22 @@ struct ForgejoWorkflowRenderContext<'a> {
     pub forgejo_token_expr: &'a str,
     pub tagging_push_token_expr: &'a str,
     pub brel_version: &'a str,
+    #[serde(flatten)]
+    pub flags: WorkflowRenderFlags,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+struct WorkflowRenderFlags {
+    #[serde(flatten)]
+    pub changelog: ChangelogRenderFlags,
+    pub tagging_enabled: bool,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+struct ChangelogRenderFlags {
     pub changelog_enabled: bool,
     pub changelog_provider_git_cliff: bool,
     pub changelog_provider_changelogen: bool,
-    pub tagging_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +95,7 @@ const GITLAB_RELEASE_PR_TEMPLATE: &str =
     include_str!("../templates/workflows/gitlab/release-pr.yml.hbs");
 const FORGEJO_RELEASE_PR_TEMPLATE: &str =
     include_str!("../templates/workflows/forgejo/release-pr.yml.hbs");
-const DEFAULT_RELEASE_PR_BODY_TEMPLATE: &str = r#"<!-- managed-by: brel -->
+const DEFAULT_RELEASE_PR_BODY_TEMPLATE: &str = r"<!-- managed-by: brel -->
 ## Release {{tag}}
 
 Base branch: `{{base_branch}}`
@@ -101,7 +109,7 @@ Release branch: `{{release_branch}}`
 {{else}}
 - No commit summaries available.
 {{/if}}
-"#;
+";
 
 pub fn render_workflow(
     provider: Provider,
@@ -149,16 +157,7 @@ fn gitlab_workflow_render_context<'a>(
         changelog_command: context.changelog_command,
         tag_command: context.tag_command,
         brel_version: env!("CARGO_PKG_VERSION"),
-        changelog_enabled: context.changelog_enabled,
-        changelog_provider_git_cliff: matches!(
-            context.changelog_provider,
-            ChangelogProvider::GitCliff
-        ),
-        changelog_provider_changelogen: matches!(
-            context.changelog_provider,
-            ChangelogProvider::Changelogen
-        ),
-        tagging_enabled: context.tagging_enabled,
+        flags: workflow_render_flags(context),
     }
 }
 
@@ -172,16 +171,7 @@ fn github_workflow_render_context<'a>(
         tag_command: context.tag_command,
         github_token_expr: context.github_token_expr,
         tagging_push_token_expr: context.tagging_push_token_expr,
-        changelog_enabled: context.changelog_enabled,
-        changelog_provider_git_cliff: matches!(
-            context.changelog_provider,
-            ChangelogProvider::GitCliff
-        ),
-        changelog_provider_changelogen: matches!(
-            context.changelog_provider,
-            ChangelogProvider::Changelogen
-        ),
-        tagging_enabled: context.tagging_enabled,
+        flags: workflow_render_flags(context),
     }
 }
 
@@ -196,15 +186,23 @@ fn forgejo_workflow_render_context<'a>(
         forgejo_token_expr: context.forgejo_token_expr,
         tagging_push_token_expr: context.tagging_push_token_expr,
         brel_version: env!("CARGO_PKG_VERSION"),
-        changelog_enabled: context.changelog_enabled,
-        changelog_provider_git_cliff: matches!(
-            context.changelog_provider,
-            ChangelogProvider::GitCliff
-        ),
-        changelog_provider_changelogen: matches!(
-            context.changelog_provider,
-            ChangelogProvider::Changelogen
-        ),
+        flags: workflow_render_flags(context),
+    }
+}
+
+fn workflow_render_flags(context: &WorkflowRenderContext<'_>) -> WorkflowRenderFlags {
+    WorkflowRenderFlags {
+        changelog: ChangelogRenderFlags {
+            changelog_enabled: context.changelog_enabled,
+            changelog_provider_git_cliff: matches!(
+                context.changelog_provider,
+                ChangelogProvider::GitCliff
+            ),
+            changelog_provider_changelogen: matches!(
+                context.changelog_provider,
+                ChangelogProvider::Changelogen
+            ),
+        },
         tagging_enabled: context.tagging_enabled,
     }
 }

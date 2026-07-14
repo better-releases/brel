@@ -101,8 +101,7 @@ pub(crate) fn build_forge<'client>(
             }))
         }
         Provider::Gitea => bail!(
-            "Provider `{}` is configured, but release PR creation currently supports only `github`, `gitlab`, or `forgejo`.",
-            provider
+            "Provider `{provider}` is configured, but release PR creation currently supports only `github`, `gitlab`, or `forgejo`."
         ),
     }
 }

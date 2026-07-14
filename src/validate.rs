@@ -2,7 +2,7 @@ use crate::cli::ValidateArgs;
 use crate::config;
 use anyhow::{Context, Result, bail};
 
-pub fn run(args: ValidateArgs) -> Result<()> {
+pub fn run(args: &ValidateArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("Failed to determine current directory.")?;
     let config = config::load(args.config.as_deref(), &cwd)?;
 

@@ -4,8 +4,8 @@ use crate::forge::forgejo::resolve_forgejo_tag_request;
 use crate::forge::github::resolve_github_tag_request;
 use crate::forge::gitlab::resolve_gitlab_tag_request;
 use crate::forge::{
-    ForgejoEnv, ForgejoHttpClient, GitlabEnv, GitlabHttpClient, ReqwestForgejoHttpClient,
-    ReqwestGitlabHttpClient, build_forge,
+    Forge, ForgePullRequest, ForgejoEnv, ForgejoHttpClient, GitlabEnv, GitlabHttpClient,
+    ReqwestForgejoHttpClient, ReqwestGitlabHttpClient, build_forge,
 };
 use crate::tag_template::TagTemplate;
 use crate::template::{self, ReleasePrBodyContext, ReleasePrCommitContext};
@@ -16,19 +16,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub fn run(args: ReleasePrArgs) -> Result<()> {
+pub fn run(args: &ReleasePrArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
     run_with_runner(&repo_root, args.config.as_deref(), &mut runner, None)
 }
 
-pub fn run_changelog(args: ChangelogArgs) -> Result<()> {
+pub fn run_changelog(args: &ChangelogArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
     run_changelog_with_runner(&repo_root, args.config.as_deref(), &mut runner)
 }
 
-pub fn run_tag(args: TagArgs) -> Result<()> {
+pub fn run_tag(args: &TagArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
     run_tag_with_runner(
@@ -41,7 +41,7 @@ pub fn run_tag(args: TagArgs) -> Result<()> {
     )
 }
 
-pub fn run_next_version(args: NextVersionArgs) -> Result<()> {
+pub fn run_next_version(args: &NextVersionArgs) -> Result<()> {
     let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
     let mut runner = ProcessRunner;
     run_next_version_with_runner(&repo_root, args.config.as_deref(), &mut runner)
@@ -158,19 +158,120 @@ fn run_with_runner_and_clients(
         .filter(|pr| pr.head_ref_name != release_branch)
         .collect::<Vec<_>>();
 
-    git_checkout_branch(runner, repo_root, &release_branch)?;
-    let mut files_to_stage = update_report.changed_files.clone();
-    maybe_append_changelog_file(repo_root, &config.release_pr, &mut files_to_stage);
-    git_add_files(runner, repo_root, &files_to_stage)?;
-    if !git_has_staged_changes(runner, repo_root)? {
+    if !commit_release_changes(
+        runner,
+        repo_root,
+        &release_branch,
+        &update_report.changed_files,
+        &config.release_pr,
+        &next_tag,
+    )? {
         println!("No staged changes after version updates. Skipping release PR.");
         return Ok(());
     }
 
-    let commit_message = format!("chore(release): {next_tag}");
-    git_commit(runner, repo_root, &config.release_pr, &commit_message)?;
-    git_push_branch(runner, repo_root, &release_branch)?;
+    let pr_title = format!("Release {next_tag}");
+    let pr_body = render_release_pr_body(
+        repo_root,
+        &config,
+        &next_release,
+        &next_version_string,
+        &next_tag,
+        &release_branch,
+    )?;
 
+    match current_pr {
+        Some(pr) => provider.edit_pr(
+            runner,
+            repo_root,
+            pr.number,
+            &config.default_branch,
+            &pr_title,
+            &pr_body,
+        )?,
+        None => provider.create_pr(
+            runner,
+            repo_root,
+            &config.default_branch,
+            &release_branch,
+            &pr_title,
+            &pr_body,
+        )?,
+    }
+    close_stale_release_prs(
+        provider.as_mut(),
+        runner,
+        repo_root,
+        stale_prs,
+        &release_branch,
+    )?;
+
+    println!("Release PR prepared for tag {next_tag}.");
+    Ok(())
+}
+
+fn close_stale_release_prs(
+    provider: &mut dyn Forge,
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    stale_prs: Vec<ForgePullRequest>,
+    release_branch: &str,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for pr in stale_prs {
+        if let Err(err) = provider.close_stale_release_pr(runner, repo_root, &pr, release_branch) {
+            eprintln!(
+                "warning: failed to close stale release PR #{} (`{}`): {err:#}",
+                pr.number, pr.head_ref_name
+            );
+            failures.push(format!("#{} (`{}`): {err:#}", pr.number, pr.head_ref_name));
+        }
+    }
+
+    if !failures.is_empty() {
+        bail!(
+            "Failed to close {} stale release pull request(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn commit_release_changes(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    release_branch: &str,
+    changed_files: &[PathBuf],
+    release_pr: &ReleasePrConfig,
+    next_tag: &str,
+) -> Result<bool> {
+    git_checkout_branch(runner, repo_root, release_branch)?;
+    let mut files_to_stage = changed_files.to_vec();
+    maybe_append_changelog_file(repo_root, release_pr, &mut files_to_stage);
+    git_add_files(runner, repo_root, &files_to_stage)?;
+    if !git_has_staged_changes(runner, repo_root)? {
+        return Ok(false);
+    }
+
+    git_commit(
+        runner,
+        repo_root,
+        release_pr,
+        &format!("chore(release): {next_tag}"),
+    )?;
+    git_push_branch(runner, repo_root, release_branch)?;
+    Ok(true)
+}
+
+fn render_release_pr_body(
+    repo_root: &Path,
+    config: &ResolvedConfig,
+    next_release: &NextRelease,
+    next_version: &str,
+    next_tag: &str,
+    release_branch: &str,
+) -> Result<String> {
     let template_override = load_template_override(repo_root, &config.release_pr)?;
     let commit_contexts = next_release
         .commits
@@ -180,62 +281,16 @@ fn run_with_runner_and_clients(
             subject: commit.subject.trim(),
         })
         .collect::<Vec<_>>();
-    let pr_title = format!("Release {next_tag}");
-    let pr_body = template::render_release_pr_body(
+    template::render_release_pr_body(
         &ReleasePrBodyContext {
-            version: &next_version_string,
-            tag: &next_tag,
+            version: next_version,
+            tag: next_tag,
             base_branch: &config.default_branch,
-            release_branch: &release_branch,
+            release_branch,
             commits: &commit_contexts,
         },
         template_override.as_deref(),
-    )?;
-
-    let mut stale_close_failures = Vec::new();
-    {
-        match current_pr {
-            Some(pr) => provider.edit_pr(
-                runner,
-                repo_root,
-                pr.number,
-                &config.default_branch,
-                &pr_title,
-                &pr_body,
-            )?,
-            None => provider.create_pr(
-                runner,
-                repo_root,
-                &config.default_branch,
-                &release_branch,
-                &pr_title,
-                &pr_body,
-            )?,
-        }
-
-        for pr in stale_prs {
-            if let Err(err) =
-                provider.close_stale_release_pr(runner, repo_root, &pr, &release_branch)
-            {
-                eprintln!(
-                    "warning: failed to close stale release PR #{} (`{}`): {err:#}",
-                    pr.number, pr.head_ref_name
-                );
-                stale_close_failures
-                    .push(format!("#{} (`{}`): {err:#}", pr.number, pr.head_ref_name));
-            }
-        }
-    }
-    if !stale_close_failures.is_empty() {
-        bail!(
-            "Failed to close {} stale release pull request(s): {}",
-            stale_close_failures.len(),
-            stale_close_failures.join("; ")
-        );
-    }
-
-    println!("Release PR prepared for tag {next_tag}.");
-    Ok(())
+    )
 }
 
 pub(crate) fn run_next_version_with_runner(
@@ -379,8 +434,7 @@ fn ensure_release_pr_provider_supported(provider: Provider, command_name: &str) 
         Provider::Github | Provider::Gitlab | Provider::Forgejo
     ) {
         bail!(
-            "Provider `{}` is configured, but `brel {command_name}` currently supports only `github`, `gitlab`, or `forgejo`.",
-            provider
+            "Provider `{provider}` is configured, but `brel {command_name}` currently supports only `github`, `gitlab`, or `forgejo`."
         );
     }
     Ok(())
@@ -659,8 +713,7 @@ fn resolve_next_release(
 
     let base_version = latest_tag
         .as_ref()
-        .map(|tag| tag.version.clone())
-        .unwrap_or_else(|| Version::new(0, 0, 0));
+        .map_or_else(|| Version::new(0, 0, 0), |tag| tag.version.clone());
 
     Ok(Some(NextRelease {
         next_version: bump_version(&base_version, next_bump),
@@ -812,8 +865,7 @@ fn conventional_commit_type(subject: &str) -> Option<String> {
         .trim()
         .trim_end_matches('!')
         .split_once('(')
-        .map(|(kind, _)| kind)
-        .unwrap_or(prefix)
+        .map_or(prefix, |(kind, _)| kind)
         .trim()
         .to_ascii_lowercase();
     if normalized.is_empty() {
@@ -1056,18 +1108,24 @@ pub(crate) fn run_checked(
         };
         bail!(
             "{context} Command `{}` failed (exit {}): {details}",
-            format_command(program, &args),
+            format_command(program, args),
             output.status
         );
     }
     Ok(output)
 }
 
-fn format_command(program: &str, args: &[String]) -> String {
+fn format_command(program: &str, args: Vec<String>) -> String {
     if args.is_empty() {
         return program.to_string();
     }
-    format!("{program} {}", args.join(" "))
+
+    let mut command = program.to_string();
+    for arg in args {
+        command.push(' ');
+        command.push_str(&arg);
+    }
+    command
 }
 
 #[cfg(test)]

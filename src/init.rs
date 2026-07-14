@@ -220,25 +220,7 @@ pub(crate) fn run_with_interactor(
 
     let workflow_path = workflow::resolve_workflow_path(config.provider, &config.workflow_file)?;
     let workflow_absolute_path = repo_root.join(&workflow_path);
-    let release_pr_command = build_release_pr_command(options.config_path.as_deref());
-    let changelog_command = build_changelog_command(options.config_path.as_deref());
-    let tag_command = build_tag_command(options.config_path.as_deref());
-    let rendered = template::render_workflow(
-        config.provider,
-        WorkflowTemplate::ReleasePr,
-        &WorkflowRenderContext {
-            default_branch: &config.default_branch,
-            release_pr_command: &release_pr_command,
-            changelog_command: &changelog_command,
-            tag_command: &tag_command,
-            github_token_expr: "${{ github.token }}",
-            forgejo_token_expr: "${{ forgejo.token }}",
-            tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
-            changelog_enabled: config.release_pr.changelog.enabled,
-            changelog_provider: config.release_pr.changelog.provider,
-            tagging_enabled: config.release_pr.tagging.enabled,
-        },
-    )?;
+    let rendered = render_release_workflow(&config, options.config_path.as_deref())?;
 
     let existing = if workflow_absolute_path.exists() {
         Some(
@@ -290,7 +272,7 @@ pub(crate) fn run_with_interactor(
                 println!("Updated `{}`", workflow_path.display());
             }
         }
-    };
+    }
 
     match config.provider {
         Provider::Gitlab => print_gitlab_token_notice(),
@@ -300,6 +282,31 @@ pub(crate) fn run_with_interactor(
     }
 
     Ok(())
+}
+
+fn render_release_workflow(
+    config: &config::ResolvedConfig,
+    config_path: Option<&Path>,
+) -> Result<String> {
+    let release_pr_command = build_release_pr_command(config_path);
+    let changelog_command = build_changelog_command(config_path);
+    let tag_command = build_tag_command(config_path);
+    template::render_workflow(
+        config.provider,
+        WorkflowTemplate::ReleasePr,
+        &WorkflowRenderContext {
+            default_branch: &config.default_branch,
+            release_pr_command: &release_pr_command,
+            changelog_command: &changelog_command,
+            tag_command: &tag_command,
+            github_token_expr: "${{ github.token }}",
+            forgejo_token_expr: "${{ forgejo.token }}",
+            tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
+            changelog_enabled: config.release_pr.changelog.enabled,
+            changelog_provider: config.release_pr.changelog.provider,
+            tagging_enabled: config.release_pr.tagging.enabled,
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,17 +440,20 @@ fn normalize_default_branch(value: &str) -> Result<String> {
 
 fn apply_init_selections(config: &mut config::ResolvedConfig, selections: &InitSelections) {
     config.provider = selections.provider;
-    config.default_branch = selections.default_branch.clone();
+    config.default_branch.clone_from(&selections.default_branch);
     config.release_pr.changelog.enabled = selections.changelog_enabled;
     config.release_pr.changelog.provider = selections.changelog_provider;
     config.release_pr.tagging.enabled = selections.tagging_enabled;
-    config.release_pr.tagging.tag_template = selections.tag_template.clone();
+    config
+        .release_pr
+        .tagging
+        .tag_template
+        .clone_from(&selections.tag_template);
 }
 
 fn bail_unsupported_init_provider(provider: Provider) -> Result<()> {
     bail!(
-        "Provider `{}` is configured, but `brel init` currently supports only `github`, `gitlab`, or `forgejo`.",
-        provider
+        "Provider `{provider}` is configured, but `brel init` currently supports only `github`, `gitlab`, or `forgejo`."
     )
 }
 

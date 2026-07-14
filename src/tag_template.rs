@@ -58,10 +58,7 @@ pub fn normalize_tag_template(value: &str) -> Result<String> {
     let canonical = trimmed.replace(LEGACY_VERSION_TOKEN, VERSION_TOKEN);
     let token_count = canonical.match_indices(VERSION_TOKEN).count();
     if token_count != 1 {
-        bail!(
-            "Tag template must include exactly one `{}` token.",
-            VERSION_TOKEN
-        );
+        bail!("Tag template must include exactly one `{VERSION_TOKEN}` token.");
     }
 
     Ok(canonical)
