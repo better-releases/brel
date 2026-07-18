@@ -122,6 +122,8 @@ default_branch = "main"
 [release_pr]
 release_branch_pattern = "brel/release/v{{version}}"
 pr_template_file = ".github/brel/release-pr-body.hbs"
+bump_minor_pre_major = false
+bump_patch_for_minor_pre_major = false
 
 [release_pr.changelog]
 enabled = true
@@ -152,6 +154,18 @@ When you run `brel release-pr`:
    - minor: `feat: ...`
    - patch: `fix: ...`
 5. If no releasable commits are found, it exits successfully with no changes.
+
+While the version is still `0.x.y`, two optional toggles soften the bump
+(both default to `false`):
+
+- `release_pr.bump_minor_pre_major = true` turns a breaking change into a
+  minor bump (`0.3.1` + `feat!` → `0.4.0` instead of `1.0.0`).
+- `release_pr.bump_patch_for_minor_pre_major = true` turns a `feat` into a
+  patch bump (`0.3.1` + `feat` → `0.3.2` instead of `0.4.0`).
+
+The demotions do not stack: with both enabled, a breaking change still bumps
+minor. Once a `1.0.0` (or later) tag exists, both toggles are ignored. To
+leave `0.x` entirely, use a `Release-As: 1.0.0` trailer or `--release-as`.
 
 To override that calculation for one release, add a `Release-As: <version>`
 trailer to a commit in the release range:

@@ -133,19 +133,19 @@ fn run_with_runner_and_clients(
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
 
-    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template, release_as)?
+    let Some(next_release) = resolve_next_release(
+        runner,
+        repo_root,
+        &tag_template,
+        release_as,
+        &config.release_pr,
+    )?
     else {
         println!("No releasable commits found. Skipping release PR.");
         return Ok(());
     };
 
-    let forced_message = next_release
-        .forced_by
-        .as_ref()
-        .map(|source| source.message(&next_release.next_version));
-    if let Some(message) = &forced_message {
-        println!("{message}");
-    }
+    print_forced_by_message(&next_release);
 
     if config.release_pr.version_updates.is_empty() {
         println!("No `release_pr.version_updates` configured. Nothing to update.");
@@ -179,14 +179,7 @@ fn run_with_runner_and_clients(
         &config.release_pr.release_branch_pattern,
         &next_version_string,
     );
-    let current_pr = managed_prs
-        .iter()
-        .find(|pr| pr.head_ref_name == release_branch)
-        .cloned();
-    let stale_prs = managed_prs
-        .into_iter()
-        .filter(|pr| pr.head_ref_name != release_branch)
-        .collect::<Vec<_>>();
+    let (current_pr, stale_prs) = split_managed_prs(managed_prs, &release_branch);
 
     if !commit_release_changes(
         runner,
@@ -238,6 +231,27 @@ fn run_with_runner_and_clients(
 
     println!("Release PR prepared for tag {next_tag}.");
     Ok(())
+}
+
+fn print_forced_by_message(next_release: &NextRelease) {
+    if let Some(source) = &next_release.forced_by {
+        println!("{}", source.message(&next_release.next_version));
+    }
+}
+
+fn split_managed_prs(
+    managed_prs: Vec<ForgePullRequest>,
+    release_branch: &str,
+) -> (Option<ForgePullRequest>, Vec<ForgePullRequest>) {
+    let current_pr = managed_prs
+        .iter()
+        .find(|pr| pr.head_ref_name == release_branch)
+        .cloned();
+    let stale_prs = managed_prs
+        .into_iter()
+        .filter(|pr| pr.head_ref_name != release_branch)
+        .collect();
+    (current_pr, stale_prs)
 }
 
 fn close_stale_release_prs(
@@ -341,7 +355,13 @@ pub(crate) fn run_next_version_with_runner(
     let config = load_config(config_path, repo_root)?;
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
-    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template, release_as)?
+    let Some(next_release) = resolve_next_release(
+        runner,
+        repo_root,
+        &tag_template,
+        release_as,
+        &config.release_pr,
+    )?
     else {
         return Ok(());
     };
@@ -364,7 +384,13 @@ pub(crate) fn run_changelog_with_runner(
 
     let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
         .context("Invalid normalized release tag template.")?;
-    let Some(next_release) = resolve_next_release(runner, repo_root, &tag_template, release_as)?
+    let Some(next_release) = resolve_next_release(
+        runner,
+        repo_root,
+        &tag_template,
+        release_as,
+        &config.release_pr,
+    )?
     else {
         println!("No releasable commits found. Skipping changelog.");
         return Ok(());
@@ -766,6 +792,7 @@ fn resolve_next_release(
     repo_root: &Path,
     tag_template: &TagTemplate,
     release_as: Option<&Version>,
+    release_pr: &ReleasePrConfig,
 ) -> Result<Option<NextRelease>> {
     let latest_tag = find_latest_release_tag(runner, repo_root, tag_template)?;
     let commits = collect_commits_since(
@@ -795,6 +822,16 @@ fn resolve_next_release(
     let base_version = latest_tag
         .as_ref()
         .map_or_else(|| Version::new(0, 0, 0), |tag| tag.version.clone());
+
+    let next_bump = if base_version.major == 0 {
+        match next_bump {
+            BumpLevel::Major if release_pr.bump_minor_pre_major => BumpLevel::Minor,
+            BumpLevel::Minor if release_pr.bump_patch_for_minor_pre_major => BumpLevel::Patch,
+            other => other,
+        }
+    } else {
+        next_bump
+    };
 
     Ok(Some(NextRelease {
         next_version: bump_version(&base_version, next_bump),
@@ -1593,14 +1630,135 @@ mod tests {
         ]);
         let template = TagTemplate::parse("v{version}").unwrap();
 
-        let release = resolve_next_release(&mut runner, temp_dir.path(), &template, None)
-            .unwrap()
-            .expect("expected releasable version");
+        let release = resolve_next_release(
+            &mut runner,
+            temp_dir.path(),
+            &template,
+            None,
+            &ReleasePrConfig::default(),
+        )
+        .unwrap()
+        .expect("expected releasable version");
 
         assert_eq!(release.next_version, Version::new(1, 3, 0));
         assert_eq!(release.commits.len(), 1);
         assert_eq!(release.commits[0].subject, "feat: add feature");
         assert_eq!(release.forced_by, None);
+    }
+
+    fn pre_major_config(
+        bump_minor_pre_major: bool,
+        bump_patch_for_minor_pre_major: bool,
+    ) -> ReleasePrConfig {
+        ReleasePrConfig {
+            bump_minor_pre_major,
+            bump_patch_for_minor_pre_major,
+            ..ReleasePrConfig::default()
+        }
+    }
+
+    fn resolve_with_config(
+        tags: &str,
+        entries: &[(&str, &str)],
+        release_pr: &ReleasePrConfig,
+    ) -> Option<NextRelease> {
+        let temp_dir = tempdir().unwrap();
+        let log = entries
+            .iter()
+            .map(|(subject, body)| log_entry("abc123456789", subject, body))
+            .collect::<String>();
+        let mut runner = ScriptedRunner::new(vec![ok(tags), ok(&log)]);
+        let template = TagTemplate::parse("v{version}").unwrap();
+
+        resolve_next_release(&mut runner, temp_dir.path(), &template, None, release_pr).unwrap()
+    }
+
+    #[test]
+    fn breaking_change_pre_major_bumps_major_by_default() {
+        let release = resolve_with_config(
+            "v0.3.1\n",
+            &[("refactor!: rewrite API", "")],
+            &ReleasePrConfig::default(),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(1, 0, 0));
+    }
+
+    #[test]
+    fn bump_minor_pre_major_demotes_breaking_change_to_minor() {
+        let release = resolve_with_config(
+            "v0.3.1\n",
+            &[("refactor!: rewrite API", "")],
+            &pre_major_config(true, false),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(0, 4, 0));
+    }
+
+    #[test]
+    fn bump_patch_for_minor_pre_major_demotes_feat_to_patch() {
+        let release = resolve_with_config(
+            "v0.3.1\n",
+            &[("feat: add endpoint", "")],
+            &pre_major_config(false, true),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(0, 3, 2));
+    }
+
+    #[test]
+    fn bump_patch_for_minor_pre_major_leaves_breaking_change_major() {
+        let release = resolve_with_config(
+            "v0.3.1\n",
+            &[("feat!: rewrite API", "")],
+            &pre_major_config(false, true),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(1, 0, 0));
+    }
+
+    #[test]
+    fn pre_major_demotions_do_not_cascade() {
+        let release = resolve_with_config(
+            "v0.3.1\n",
+            &[("feat!: rewrite API", ""), ("feat: add endpoint", "")],
+            &pre_major_config(true, true),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(0, 4, 0));
+    }
+
+    #[test]
+    fn both_toggles_demote_feat_only_commits_to_patch() {
+        let release = resolve_with_config(
+            "v0.3.1\n",
+            &[("feat: add endpoint", "")],
+            &pre_major_config(true, true),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(0, 3, 2));
+    }
+
+    #[test]
+    fn pre_major_toggles_are_ignored_after_one_point_zero() {
+        let release = resolve_with_config(
+            "v1.2.3\n",
+            &[("feat!: rewrite API", "")],
+            &pre_major_config(true, true),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(2, 0, 0));
+    }
+
+    #[test]
+    fn pre_major_toggles_apply_to_untagged_baseline() {
+        let release = resolve_with_config(
+            "",
+            &[("feat!: initial API", "")],
+            &pre_major_config(true, false),
+        )
+        .expect("expected releasable version");
+        assert_eq!(release.next_version, Version::new(0, 1, 0));
     }
 
     #[test]
@@ -1612,7 +1770,14 @@ mod tests {
         ]);
         let template = TagTemplate::parse("v{version}").unwrap();
 
-        let release = resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap();
+        let release = resolve_next_release(
+            &mut runner,
+            temp_dir.path(),
+            &template,
+            None,
+            &ReleasePrConfig::default(),
+        )
+        .unwrap();
         assert!(release.is_none());
     }
 
@@ -1686,9 +1851,15 @@ mod tests {
         let mut runner = ScriptedRunner::new(vec![ok("v1.2.3\n"), ok(&commits)]);
         let template = TagTemplate::parse("v{version}").unwrap();
 
-        let release = resolve_next_release(&mut runner, temp_dir.path(), &template, None)
-            .unwrap()
-            .expect("footer should force a release");
+        let release = resolve_next_release(
+            &mut runner,
+            temp_dir.path(),
+            &template,
+            None,
+            &ReleasePrConfig::default(),
+        )
+        .unwrap()
+        .expect("footer should force a release");
 
         assert_eq!(release.next_version, Version::new(1, 8, 0));
         assert_eq!(
@@ -1711,10 +1882,15 @@ mod tests {
         let template = TagTemplate::parse("v{version}").unwrap();
         let flag_version = Version::new(2, 0, 0);
 
-        let release =
-            resolve_next_release(&mut runner, temp_dir.path(), &template, Some(&flag_version))
-                .unwrap()
-                .expect("flag should force a release");
+        let release = resolve_next_release(
+            &mut runner,
+            temp_dir.path(),
+            &template,
+            Some(&flag_version),
+            &ReleasePrConfig::default(),
+        )
+        .unwrap()
+        .expect("flag should force a release");
 
         assert_eq!(release.next_version, flag_version);
         assert_eq!(release.forced_by, Some(ForcedBy::Flag));
@@ -1733,7 +1909,14 @@ mod tests {
         ]);
         let template = TagTemplate::parse("v{version}").unwrap();
 
-        let err = resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap_err();
+        let err = resolve_next_release(
+            &mut runner,
+            temp_dir.path(),
+            &template,
+            None,
+            &ReleasePrConfig::default(),
+        )
+        .unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -1754,7 +1937,14 @@ mod tests {
         ]);
         let template = TagTemplate::parse("v{version}").unwrap();
 
-        let err = resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap_err();
+        let err = resolve_next_release(
+            &mut runner,
+            temp_dir.path(),
+            &template,
+            None,
+            &ReleasePrConfig::default(),
+        )
+        .unwrap_err();
         let message = format!("{err:#}");
 
         assert!(message.contains("Invalid Release-As version `v2.0` in commit abc1234."));
@@ -1774,8 +1964,14 @@ mod tests {
             ]);
             let template = TagTemplate::parse("v{version}").unwrap();
 
-            let err =
-                resolve_next_release(&mut runner, temp_dir.path(), &template, None).unwrap_err();
+            let err = resolve_next_release(
+                &mut runner,
+                temp_dir.path(),
+                &template,
+                None,
+                &ReleasePrConfig::default(),
+            )
+            .unwrap_err();
 
             assert_eq!(
                 err.to_string(),
@@ -1810,8 +2006,14 @@ mod tests {
             ]);
             let forced = Version::parse(forced).unwrap();
 
-            let err = resolve_next_release(&mut runner, temp_dir.path(), &template, Some(&forced))
-                .unwrap_err();
+            let err = resolve_next_release(
+                &mut runner,
+                temp_dir.path(),
+                &template,
+                Some(&forced),
+                &ReleasePrConfig::default(),
+            )
+            .unwrap_err();
 
             assert_eq!(err.to_string(), expected);
         }
