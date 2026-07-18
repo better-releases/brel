@@ -270,6 +270,8 @@ pub struct ReleasePrConfig {
     pub format_overrides: BTreeMap<String, VersionFileFormat>,
     pub release_branch_pattern: String,
     pub pr_template_file: Option<String>,
+    pub bump_minor_pre_major: bool,
+    pub bump_patch_for_minor_pre_major: bool,
     pub commit_author: CommitAuthorConfig,
     pub changelog: ChangelogConfig,
     pub tagging: TaggingConfig,
@@ -282,6 +284,8 @@ impl Default for ReleasePrConfig {
             format_overrides: BTreeMap::new(),
             release_branch_pattern: DEFAULT_RELEASE_BRANCH_PATTERN.to_string(),
             pr_template_file: None,
+            bump_minor_pre_major: false,
+            bump_patch_for_minor_pre_major: false,
             commit_author: CommitAuthorConfig {
                 name: DEFAULT_COMMIT_AUTHOR_NAME.to_string(),
                 email: DEFAULT_COMMIT_AUTHOR_EMAIL.to_string(),
@@ -326,6 +330,8 @@ struct RawReleasePrConfig {
     format_overrides: Option<BTreeMap<String, String>>,
     release_branch_pattern: Option<String>,
     pr_template_file: Option<String>,
+    bump_minor_pre_major: Option<bool>,
+    bump_patch_for_minor_pre_major: Option<bool>,
     commit_author: Option<RawCommitAuthorConfig>,
     changelog: Option<RawChangelogConfig>,
     tagging: Option<RawTaggingConfig>,
@@ -448,6 +454,8 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         format_overrides,
         release_branch_pattern,
         pr_template_file,
+        bump_minor_pre_major,
+        bump_patch_for_minor_pre_major,
         commit_author,
         changelog,
         tagging,
@@ -464,6 +472,8 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         format_overrides,
         release_branch_pattern,
         pr_template_file,
+        bump_minor_pre_major: bump_minor_pre_major.unwrap_or(false),
+        bump_patch_for_minor_pre_major: bump_patch_for_minor_pre_major.unwrap_or(false),
         commit_author: resolve_commit_author(commit_author)?,
         changelog: resolve_changelog_config(changelog)?,
         tagging: resolve_tagging_config(tagging)?,
@@ -716,6 +726,8 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
         "format_overrides",
         "release_branch_pattern",
         "pr_template_file",
+        "bump_minor_pre_major",
+        "bump_patch_for_minor_pre_major",
         "commit_author",
         "changelog",
         "tagging",
@@ -1131,6 +1143,33 @@ version = "0.5.0"
         );
         assert_eq!(config.release_pr.changelog.output_file, "docs/changelog.md");
         assert_eq!(config.release_pr.changelog.changelogen.version, "0.5.0");
+    }
+
+    #[test]
+    fn pre_major_bump_toggles_default_to_false() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("brel.toml"), "[release_pr]\n").unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert!(!config.release_pr.bump_minor_pre_major);
+        assert!(!config.release_pr.bump_patch_for_minor_pre_major);
+    }
+
+    #[test]
+    fn parses_pre_major_bump_toggles() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            "[release_pr]\nbump_minor_pre_major = true\nbump_patch_for_minor_pre_major = true\n",
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert!(config.release_pr.bump_minor_pre_major);
+        assert!(config.release_pr.bump_patch_for_minor_pre_major);
+        assert!(config.warnings.is_empty());
     }
 
     #[test]

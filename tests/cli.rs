@@ -55,6 +55,58 @@ fn next_version_prints_semver_when_releasable_commits_exist() {
 }
 
 #[test]
+fn next_version_bump_minor_pre_major_demotes_breaking_change() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        "\n[release_pr]\nbump_minor_pre_major = true\n",
+    )
+    .unwrap();
+    run_git(temp_dir.path(), &["add", "brel.toml"]);
+    run_git(temp_dir.path(), &["commit", "-m", "chore: add config"]);
+    run_git(temp_dir.path(), &["tag", "v0.1.0"]);
+
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat!: breaking change"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("0.2.0\n"));
+}
+
+#[test]
+fn next_version_bump_patch_for_minor_pre_major_demotes_feat() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        "\n[release_pr]\nbump_patch_for_minor_pre_major = true\n",
+    )
+    .unwrap();
+    run_git(temp_dir.path(), &["add", "brel.toml"]);
+    run_git(temp_dir.path(), &["commit", "-m", "chore: add config"]);
+    run_git(temp_dir.path(), &["tag", "v0.1.0"]);
+
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat: add feature"]);
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("next-version")
+        .assert()
+        .success()
+        .stdout(predicate::eq("0.1.1\n"));
+}
+
+#[test]
 fn next_version_prints_nothing_when_no_releasable_commits_exist() {
     let temp_dir = tempdir().unwrap();
     init_git_repo(temp_dir.path());
