@@ -169,7 +169,7 @@ pub(crate) fn resolve_gh_token(override_token: Option<&str>) -> Result<String> {
     if let Some(token) = override_token {
         if token.trim().is_empty() {
             bail!(
-                "Missing GitHub auth token. Set `GH_TOKEN` (or `GITHUB_TOKEN`) before running `brel release-pr`."
+                "Missing GitHub auth token. Set `GH_TOKEN` (or `GITHUB_TOKEN`) before running this command."
             );
         }
         return Ok(token.to_string());
@@ -188,7 +188,7 @@ pub(crate) fn resolve_gh_token(override_token: Option<&str>) -> Result<String> {
     }
 
     bail!(
-        "Missing GitHub auth token. Set `GH_TOKEN` (or `GITHUB_TOKEN`) before running `brel release-pr`."
+        "Missing GitHub auth token. Set `GH_TOKEN` (or `GITHUB_TOKEN`) before running this command."
     )
 }
 
@@ -199,6 +199,7 @@ pub(crate) struct GithubPullRequestEvent {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GithubEventPullRequest {
+    number: Option<u64>,
     merged: Option<bool>,
     title: Option<String>,
     body: Option<String>,
@@ -282,4 +283,208 @@ pub(crate) fn resolve_github_tag_request(
         target,
         mode: TagRequestMode::GithubEvent,
     }))
+}
+
+pub(crate) fn resolve_github_preview_target(
+    repo_root: &Path,
+    github_event_path_override: Option<&Path>,
+) -> Result<Option<u64>> {
+    let event_path = match github_event_path_override {
+        Some(path) => path.to_path_buf(),
+        None => std::env::var_os("GITHUB_EVENT_PATH")
+            .map(PathBuf::from)
+            .context("Missing `GITHUB_EVENT_PATH`. Pass `--pr-number` for manual mode.")?,
+    };
+    let event = read_github_pull_request_event(repo_root, &event_path)?;
+    let Some(pull_request) = event.pull_request else {
+        println!("GitHub event does not contain a pull request. Skipping preview comment.");
+        return Ok(None);
+    };
+    if pull_request.merged.unwrap_or(false) {
+        println!("GitHub pull request is already merged. Skipping preview comment.");
+        return Ok(None);
+    }
+    if pull_request
+        .body
+        .as_deref()
+        .is_some_and(|body| body.contains(MANAGED_RELEASE_PR_MARKER))
+    {
+        println!("PR is managed by brel. Skipping preview comment.");
+        return Ok(None);
+    }
+    let Some(number) = pull_request.number else {
+        println!("GitHub event does not contain a pull request number. Skipping preview comment.");
+        return Ok(None);
+    };
+
+    Ok(Some(number))
+}
+
+#[derive(Debug, Deserialize)]
+struct GhIssueComment {
+    id: u64,
+    body: Option<String>,
+    user: Option<GhCommentUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCommentUser {
+    login: Option<String>,
+}
+
+pub(crate) const GITHUB_ACTIONS_BOT_LOGIN: &str = "github-actions[bot]";
+
+pub(crate) fn gh_authenticated_login(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    gh_env: &[(String, String)],
+) -> String {
+    // The Actions installation token cannot call `/user`; fall back to the Actions bot identity.
+    let output = runner.run(
+        repo_root,
+        "gh",
+        &[
+            "api".to_string(),
+            "user".to_string(),
+            "--jq".to_string(),
+            ".login".to_string(),
+        ],
+        gh_env,
+    );
+    match output {
+        Ok(output) if output.status == 0 && !output.stdout.trim().is_empty() => {
+            output.stdout.trim().to_string()
+        }
+        _ => GITHUB_ACTIONS_BOT_LOGIN.to_string(),
+    }
+}
+
+pub(crate) fn gh_pull_request_body(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    number: u64,
+    gh_env: &[(String, String)],
+) -> Result<String> {
+    #[derive(Debug, Deserialize)]
+    struct GhPullRequestBody {
+        body: Option<String>,
+    }
+
+    let output = run_checked(
+        runner,
+        repo_root,
+        "gh",
+        vec![
+            "pr".to_string(),
+            "view".to_string(),
+            number.to_string(),
+            "--json".to_string(),
+            "body".to_string(),
+        ],
+        gh_env,
+        "Failed to view pull request via gh.",
+    )?;
+    let pr: GhPullRequestBody = serde_json::from_str(&output.stdout)
+        .context("Failed to parse `gh pr view` JSON output.")?;
+    Ok(pr.body.unwrap_or_default())
+}
+
+const GH_COMMENTS_PER_PAGE: usize = 100;
+
+pub(crate) fn gh_find_marker_issue_comment(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    number: u64,
+    marker: &str,
+    author_login: &str,
+    gh_env: &[(String, String)],
+) -> Result<Option<u64>> {
+    for page in 1.. {
+        let output = run_checked(
+            runner,
+            repo_root,
+            "gh",
+            vec![
+                "api".to_string(),
+                format!(
+                    "repos/{{owner}}/{{repo}}/issues/{number}/comments?per_page={GH_COMMENTS_PER_PAGE}&page={page}"
+                ),
+            ],
+            gh_env,
+            "Failed to list pull request comments via gh.",
+        )?;
+        let comments: Vec<GhIssueComment> = serde_json::from_str(&output.stdout)
+            .context("Failed to parse pull request comments JSON output.")?;
+        let page_len = comments.len();
+        let found = comments
+            .into_iter()
+            .find(|comment| {
+                // Only trust our own comments: any PR participant can paste the marker.
+                comment
+                    .user
+                    .as_ref()
+                    .and_then(|user| user.login.as_deref())
+                    .is_some_and(|login| login == author_login)
+                    && comment
+                        .body
+                        .as_deref()
+                        .is_some_and(|body| body.contains(marker))
+            })
+            .map(|comment| comment.id);
+        if found.is_some() {
+            return Ok(found);
+        }
+        if page_len < GH_COMMENTS_PER_PAGE {
+            return Ok(None);
+        }
+    }
+    unreachable!("comment pagination loop always returns");
+}
+
+pub(crate) fn gh_create_issue_comment(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    number: u64,
+    body: &str,
+    gh_env: &[(String, String)],
+) -> Result<()> {
+    run_checked(
+        runner,
+        repo_root,
+        "gh",
+        vec![
+            "api".to_string(),
+            format!("repos/{{owner}}/{{repo}}/issues/{number}/comments"),
+            "-f".to_string(),
+            format!("body={body}"),
+        ],
+        gh_env,
+        "Failed to create pull request comment via gh.",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn gh_update_issue_comment(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    comment_id: u64,
+    body: &str,
+    gh_env: &[(String, String)],
+) -> Result<()> {
+    run_checked(
+        runner,
+        repo_root,
+        "gh",
+        vec![
+            "api".to_string(),
+            "--method".to_string(),
+            "PATCH".to_string(),
+            format!("repos/{{owner}}/{{repo}}/issues/comments/{comment_id}"),
+            "-f".to_string(),
+            format!("body={body}"),
+        ],
+        gh_env,
+        "Failed to update pull request comment via gh.",
+    )?;
+    Ok(())
 }

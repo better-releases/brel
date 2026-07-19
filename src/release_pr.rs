@@ -1,7 +1,11 @@
-use crate::cli::{ChangelogArgs, NextVersionArgs, ReleasePrArgs, TagArgs};
+use crate::cli::{ChangelogArgs, NextVersionArgs, PreviewCommentArgs, ReleasePrArgs, TagArgs};
 use crate::config::{self, ChangelogProvider, Provider, ReleasePrConfig, ResolvedConfig};
 use crate::forge::forgejo::resolve_forgejo_tag_request;
-use crate::forge::github::resolve_github_tag_request;
+use crate::forge::github::{
+    gh_authenticated_login, gh_create_issue_comment, gh_find_marker_issue_comment,
+    gh_pull_request_body, gh_update_issue_comment, resolve_gh_token, resolve_github_preview_target,
+    resolve_github_tag_request,
+};
 use crate::forge::gitlab::resolve_gitlab_tag_request;
 use crate::forge::{
     Forge, ForgePullRequest, ForgejoEnv, ForgejoHttpClient, GitlabEnv, GitlabHttpClient,
@@ -344,6 +348,155 @@ fn render_release_pr_body(
     }
 
     Ok(pr_body)
+}
+
+pub fn run_preview_comment(args: &PreviewCommentArgs) -> Result<()> {
+    let repo_root = std::env::current_dir().context("Failed to determine current directory.")?;
+    let mut runner = ProcessRunner;
+    run_preview_comment_with_runner(
+        &repo_root,
+        args.config.as_deref(),
+        args.pr_number,
+        args.release_as.as_ref(),
+        &mut runner,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn run_preview_comment_with_runner(
+    repo_root: &Path,
+    config_path: Option<&Path>,
+    pr_number_arg: Option<u64>,
+    release_as: Option<&Version>,
+    runner: &mut dyn CommandRunner,
+    github_event_path_override: Option<&Path>,
+    auth_token_override: Option<&str>,
+) -> Result<()> {
+    let config = load_config(config_path, repo_root)?;
+    if config.provider != Provider::Github {
+        bail!(
+            "Provider `{}` is configured, but `brel preview-comment` currently supports only `github`.",
+            config.provider
+        );
+    }
+    if !config.release_pr.preview_comment.enabled {
+        println!("Preview comments are disabled. Skipping preview comment.");
+        return Ok(());
+    }
+
+    let token = resolve_gh_token(auth_token_override)?;
+    let gh_env = vec![("GH_TOKEN".to_string(), token)];
+
+    let pr_number = if let Some(number) = pr_number_arg {
+        let body = gh_pull_request_body(runner, repo_root, number, &gh_env)?;
+        if body.contains(template::MANAGED_RELEASE_PR_MARKER) {
+            println!("PR is managed by brel. Skipping preview comment.");
+            return Ok(());
+        }
+        number
+    } else {
+        let Some(number) = resolve_github_preview_target(repo_root, github_event_path_override)?
+        else {
+            return Ok(());
+        };
+        number
+    };
+
+    let tag_template = TagTemplate::parse(&config.release_pr.tagging.tag_template)
+        .context("Invalid normalized release tag template.")?;
+    let next_release = resolve_next_release(
+        runner,
+        repo_root,
+        &tag_template,
+        release_as,
+        &config.release_pr,
+    )?;
+
+    let comment_author = gh_authenticated_login(runner, repo_root, &gh_env);
+
+    let Some(next_release) = next_release else {
+        return refresh_stale_preview_comment(
+            runner,
+            repo_root,
+            pr_number,
+            &config.default_branch,
+            &comment_author,
+            &gh_env,
+        );
+    };
+
+    let next_version_string = next_release.next_version.to_string();
+    let next_tag = tag_template.render(&next_version_string);
+    let current_version = next_release
+        .latest_tag
+        .as_ref()
+        .map(|tag| tag.version.to_string());
+    let forced_note = next_release
+        .forced_by
+        .as_ref()
+        .map(|source| source.message(&next_release.next_version));
+    let body = template::render_preview_comment(&template::PreviewCommentContext {
+        projected_version: Some(&next_version_string),
+        projected_tag: Some(&next_tag),
+        current_version: current_version.as_deref(),
+        base_branch: &config.default_branch,
+        forced_note: forced_note.as_deref(),
+    })?;
+
+    let existing = gh_find_marker_issue_comment(
+        runner,
+        repo_root,
+        pr_number,
+        template::PREVIEW_COMMENT_MARKER,
+        &comment_author,
+        &gh_env,
+    )?;
+    if let Some(comment_id) = existing {
+        gh_update_issue_comment(runner, repo_root, comment_id, &body, &gh_env)?;
+        println!(
+            "Updated release preview comment on PR #{pr_number}: next version {next_version_string}."
+        );
+    } else {
+        gh_create_issue_comment(runner, repo_root, pr_number, &body, &gh_env)?;
+        println!(
+            "Posted release preview comment on PR #{pr_number}: next version {next_version_string}."
+        );
+    }
+
+    Ok(())
+}
+
+fn refresh_stale_preview_comment(
+    runner: &mut dyn CommandRunner,
+    repo_root: &Path,
+    pr_number: u64,
+    base_branch: &str,
+    comment_author: &str,
+    gh_env: &[(String, String)],
+) -> Result<()> {
+    let existing = gh_find_marker_issue_comment(
+        runner,
+        repo_root,
+        pr_number,
+        template::PREVIEW_COMMENT_MARKER,
+        comment_author,
+        gh_env,
+    )?;
+    let Some(comment_id) = existing else {
+        println!("No releasable commits found. Skipping preview comment.");
+        return Ok(());
+    };
+    let body = template::render_preview_comment(&template::PreviewCommentContext {
+        projected_version: None,
+        projected_tag: None,
+        current_version: None,
+        base_branch,
+        forced_note: None,
+    })?;
+    gh_update_issue_comment(runner, repo_root, comment_id, &body, gh_env)?;
+    println!("Updated release preview comment on PR #{pr_number}: no releasable commits.");
+    Ok(())
 }
 
 pub(crate) fn run_next_version_with_runner(
@@ -768,6 +921,7 @@ struct NextRelease {
     next_version: Version,
     commits: Vec<CommitInfo>,
     forced_by: Option<ForcedBy>,
+    latest_tag: Option<TaggedVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -812,6 +966,7 @@ fn resolve_next_release(
             next_version: forced,
             commits,
             forced_by: Some(source),
+            latest_tag,
         }));
     }
 
@@ -837,6 +992,7 @@ fn resolve_next_release(
         next_version: bump_version(&base_version, next_bump),
         commits,
         forced_by: None,
+        latest_tag,
     }))
 }
 
@@ -3935,5 +4091,462 @@ enabled = false
 
         assert!(add_call.args.contains(&"package.json".to_string()));
         assert!(!add_call.args.contains(&"CHANGELOG.md".to_string()));
+    }
+
+    fn write_preview_comment_config(repo_root: &Path) {
+        fs::write(
+            repo_root.join("brel.toml"),
+            "[release_pr.preview_comment]\nenabled = true\n",
+        )
+        .unwrap();
+    }
+
+    fn write_preview_pull_request_event(repo_root: &Path, number: u64, body: &str) -> PathBuf {
+        let path = repo_root.join("preview-event.json");
+        let event = serde_json::json!({
+            "pull_request": {
+                "number": number,
+                "merged": false,
+                "body": body,
+            }
+        });
+        fs::write(&path, serde_json::to_string(&event).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn preview_comment_posts_new_comment_with_projected_version() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+        let event_path =
+            write_preview_pull_request_event(temp_dir.path(), 12, "Adds a new feature.");
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.0\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            status(1),
+            ok("[]"),
+            ok(""),
+        ]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        let login_call = &runner.calls[2];
+        assert!(args_equal(
+            &login_call.args,
+            &["api", "user", "--jq", ".login"]
+        ));
+
+        let list_call = &runner.calls[3];
+        assert_eq!(list_call.program, "gh");
+        assert!(args_equal(
+            &list_call.args,
+            &[
+                "api",
+                "repos/{owner}/{repo}/issues/12/comments?per_page=100&page=1"
+            ],
+        ));
+        assert!(
+            list_call
+                .env
+                .contains(&("GH_TOKEN".to_string(), "gh-token".to_string()))
+        );
+
+        let create_call = &runner.calls[4];
+        assert!(args_start_with(
+            &create_call.args,
+            &["api", "repos/{owner}/{repo}/issues/12/comments", "-f"],
+        ));
+        let body_arg = create_call.args.last().unwrap();
+        assert!(body_arg.contains(template::PREVIEW_COMMENT_MARKER));
+        assert!(body_arg.contains("`1.3.0`"));
+        assert!(body_arg.contains("`v1.3.0`"));
+        assert!(body_arg.contains("from `1.2.0`"));
+    }
+
+    #[test]
+    fn preview_comment_updates_existing_marker_comment() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+        let event_path = write_preview_pull_request_event(temp_dir.path(), 12, "PR body");
+
+        let existing_comments = serde_json::json!([
+            { "id": 41, "body": "unrelated comment", "user": { "login": "someone" } },
+            {
+                "id": 991,
+                "body": format!("{}\nold preview", template::PREVIEW_COMMENT_MARKER),
+                "user": { "login": "brel-bot" },
+            },
+        ]);
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.0\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            ok("brel-bot\n"),
+            ok(&existing_comments.to_string()),
+            ok(""),
+        ]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        let update_call = &runner.calls[4];
+        assert!(args_start_with(
+            &update_call.args,
+            &[
+                "api",
+                "--method",
+                "PATCH",
+                "repos/{owner}/{repo}/issues/comments/991",
+                "-f",
+            ],
+        ));
+        assert!(update_call.args.last().unwrap().contains("`1.3.0`"));
+        assert_eq!(runner.calls.len(), 5);
+    }
+
+    #[test]
+    fn preview_comment_ignores_marker_comment_from_other_author() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+        let event_path = write_preview_pull_request_event(temp_dir.path(), 12, "PR body");
+
+        let injected_comments = serde_json::json!([
+            {
+                "id": 666,
+                "body": format!("{}\ninjected by attacker", template::PREVIEW_COMMENT_MARKER),
+                "user": { "login": "attacker" },
+            },
+        ]);
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.0\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            status(1),
+            ok(&injected_comments.to_string()),
+            ok(""),
+        ]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        let create_call = &runner.calls[4];
+        assert!(args_start_with(
+            &create_call.args,
+            &["api", "repos/{owner}/{repo}/issues/12/comments", "-f"],
+        ));
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.args.contains(&"PATCH".to_string()))
+        );
+    }
+
+    #[test]
+    fn preview_comment_paginates_to_find_marker_comment_beyond_first_page() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+        let event_path = write_preview_pull_request_event(temp_dir.path(), 12, "PR body");
+
+        let first_page = serde_json::Value::Array(
+            (1..=100)
+                .map(|id| {
+                    serde_json::json!({
+                        "id": id,
+                        "body": "unrelated comment",
+                        "user": { "login": "someone" },
+                    })
+                })
+                .collect(),
+        );
+        let second_page = serde_json::json!([
+            {
+                "id": 991,
+                "body": format!("{}\nold preview", template::PREVIEW_COMMENT_MARKER),
+                "user": { "login": "github-actions[bot]" },
+            },
+        ]);
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.0\n"),
+            ok(&log_entry("abc123456789", "feat: add feature", "")),
+            status(1),
+            ok(&first_page.to_string()),
+            ok(&second_page.to_string()),
+            ok(""),
+        ]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        assert!(args_equal(
+            &runner.calls[3].args,
+            &[
+                "api",
+                "repos/{owner}/{repo}/issues/12/comments?per_page=100&page=1"
+            ],
+        ));
+        assert!(args_equal(
+            &runner.calls[4].args,
+            &[
+                "api",
+                "repos/{owner}/{repo}/issues/12/comments?per_page=100&page=2"
+            ],
+        ));
+        let update_call = &runner.calls[5];
+        assert!(args_start_with(
+            &update_call.args,
+            &[
+                "api",
+                "--method",
+                "PATCH",
+                "repos/{owner}/{repo}/issues/comments/991",
+                "-f",
+            ],
+        ));
+        assert_eq!(runner.calls.len(), 6);
+    }
+
+    #[test]
+    fn preview_comment_skips_managed_release_pr() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+        let body = format!("{MANAGED_RELEASE_PR_MARKER}\n## Release v1.3.0");
+        let event_path = write_preview_pull_request_event(temp_dir.path(), 12, &body);
+
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn preview_comment_updates_existing_comment_when_no_releasable_commits() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+        let event_path = write_preview_pull_request_event(temp_dir.path(), 12, "PR body");
+
+        let existing_comments = serde_json::json!([
+            {
+                "id": 991,
+                "body": format!("{}\nold preview", template::PREVIEW_COMMENT_MARKER),
+                "user": { "login": "github-actions[bot]" },
+            },
+        ]);
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.0\n"),
+            ok(&log_entry("abc123456789", "chore: tidy", "")),
+            status(1),
+            ok(&existing_comments.to_string()),
+            ok(""),
+        ]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        let update_call = &runner.calls[4];
+        assert!(args_start_with(
+            &update_call.args,
+            &[
+                "api",
+                "--method",
+                "PATCH",
+                "repos/{owner}/{repo}/issues/comments/991",
+                "-f",
+            ],
+        ));
+        assert!(
+            update_call
+                .args
+                .last()
+                .unwrap()
+                .contains("would not produce a release")
+        );
+    }
+
+    #[test]
+    fn preview_comment_skips_when_no_releasable_commits_and_no_existing_comment() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+        let event_path = write_preview_pull_request_event(temp_dir.path(), 12, "PR body");
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok("v1.2.0\n"),
+            ok(&log_entry("abc123456789", "chore: tidy", "")),
+            status(1),
+            ok("[]"),
+        ]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        assert_eq!(runner.calls.len(), 4);
+    }
+
+    #[test]
+    fn preview_comment_disabled_config_is_a_no_op() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(temp_dir.path().join("brel.toml"), "provider = \"github\"\n").unwrap();
+        let event_path = write_preview_pull_request_event(temp_dir.path(), 12, "PR body");
+
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            Some(event_path.as_path()),
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn preview_comment_rejects_non_github_provider() {
+        let temp_dir = tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("brel.toml"),
+            "provider = \"gitlab\"\n\n[release_pr.preview_comment]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let mut runner = ScriptedRunner::new(vec![]);
+
+        let err = run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            None,
+            None,
+            &mut runner,
+            None,
+            Some("gh-token"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("supports only `github`"));
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn preview_comment_pr_number_flag_fetches_body_and_posts() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+
+        let mut runner = ScriptedRunner::new(vec![
+            ok(r#"{ "body": "A contributor PR" }"#),
+            ok("v1.2.0\n"),
+            ok(&log_entry("abc123456789", "fix: bug", "")),
+            status(1),
+            ok("[]"),
+            ok(""),
+        ]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            Some(7),
+            None,
+            &mut runner,
+            None,
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        let view_call = &runner.calls[0];
+        assert!(args_equal(
+            &view_call.args,
+            &["pr", "view", "7", "--json", "body"],
+        ));
+        let create_call = &runner.calls[5];
+        assert!(args_start_with(
+            &create_call.args,
+            &["api", "repos/{owner}/{repo}/issues/7/comments", "-f"],
+        ));
+        assert!(create_call.args.last().unwrap().contains("`1.2.1`"));
+    }
+
+    #[test]
+    fn preview_comment_pr_number_flag_skips_managed_pr() {
+        let temp_dir = tempdir().unwrap();
+        write_preview_comment_config(temp_dir.path());
+
+        let body_json = serde_json::json!({
+            "body": format!("{MANAGED_RELEASE_PR_MARKER}\n## Release v1.3.0")
+        });
+        let mut runner = ScriptedRunner::new(vec![ok(&body_json.to_string())]);
+
+        run_preview_comment_with_runner(
+            temp_dir.path(),
+            None,
+            Some(7),
+            None,
+            &mut runner,
+            None,
+            Some("gh-token"),
+        )
+        .unwrap();
+
+        assert_eq!(runner.calls.len(), 1);
     }
 }

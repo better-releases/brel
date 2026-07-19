@@ -14,12 +14,14 @@ pub struct WorkflowRenderContext<'a> {
     pub release_pr_command: &'a str,
     pub changelog_command: &'a str,
     pub tag_command: &'a str,
+    pub preview_comment_command: &'a str,
     pub github_token_expr: &'a str,
     pub forgejo_token_expr: &'a str,
     pub tagging_push_token_expr: &'a str,
     pub changelog_enabled: bool,
     pub changelog_provider: ChangelogProvider,
     pub tagging_enabled: bool,
+    pub preview_comment_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -28,6 +30,7 @@ struct GithubWorkflowRenderContext<'a> {
     pub release_pr_command: &'a str,
     pub changelog_command: &'a str,
     pub tag_command: &'a str,
+    pub preview_comment_command: &'a str,
     pub github_token_expr: &'a str,
     pub tagging_push_token_expr: &'a str,
     #[serde(flatten)]
@@ -63,6 +66,8 @@ struct WorkflowRenderFlags {
     #[serde(flatten)]
     pub changelog: ChangelogRenderFlags,
     pub tagging_enabled: bool,
+    pub preview_comment_enabled: bool,
+    pub pull_request_trigger_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -88,6 +93,16 @@ pub struct ReleasePrBodyContext<'a> {
 }
 
 pub const MANAGED_RELEASE_PR_MARKER: &str = "<!-- managed-by: brel -->";
+pub const PREVIEW_COMMENT_MARKER: &str = "<!-- brel: preview-comment -->";
+
+#[derive(Debug, Serialize)]
+pub struct PreviewCommentContext<'a> {
+    pub projected_version: Option<&'a str>,
+    pub projected_tag: Option<&'a str>,
+    pub current_version: Option<&'a str>,
+    pub base_branch: &'a str,
+    pub forced_note: Option<&'a str>,
+}
 
 const GITHUB_RELEASE_PR_TEMPLATE: &str =
     include_str!("../templates/workflows/github/release-pr.yml.hbs");
@@ -169,6 +184,7 @@ fn github_workflow_render_context<'a>(
         release_pr_command: context.release_pr_command,
         changelog_command: context.changelog_command,
         tag_command: context.tag_command,
+        preview_comment_command: context.preview_comment_command,
         github_token_expr: context.github_token_expr,
         tagging_push_token_expr: context.tagging_push_token_expr,
         flags: workflow_render_flags(context),
@@ -204,7 +220,28 @@ fn workflow_render_flags(context: &WorkflowRenderContext<'_>) -> WorkflowRenderF
             ),
         },
         tagging_enabled: context.tagging_enabled,
+        preview_comment_enabled: context.preview_comment_enabled,
+        pull_request_trigger_enabled: context.tagging_enabled || context.preview_comment_enabled,
     }
+}
+
+const PREVIEW_COMMENT_TEMPLATE: &str = r"<!-- brel: preview-comment -->
+### Release preview
+
+{{#if projected_version}}
+With the current commits and configuration, merging this PR (together with the pending brel release PR, if any) would bump the version {{#if current_version}}from `{{current_version}}` {{/if}}to **`{{projected_version}}`** (tag `{{projected_tag}}`).
+{{#if forced_note}}
+{{forced_note}}
+{{/if}}
+
+_This is an estimate based on the commits currently on `{{base_branch}}` plus this PR; it changes as either does._
+{{else}}
+Merging this PR would not produce a release: no releasable commits were found.
+{{/if}}
+";
+
+pub fn render_preview_comment(context: &PreviewCommentContext<'_>) -> Result<String> {
+    render_template("preview-comment", PREVIEW_COMMENT_TEMPLATE, context)
 }
 
 pub fn render_release_pr_body(
@@ -241,12 +278,14 @@ mod tests {
                 release_pr_command: "brel release-pr --config custom.toml",
                 changelog_command: "brel changelog --config custom.toml",
                 tag_command: "brel tag --config custom.toml",
+                preview_comment_command: "brel preview-comment --config custom.toml",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: false,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -276,12 +315,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
+                preview_comment_command: "brel preview-comment",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: false,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: false,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -303,12 +344,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
+                preview_comment_command: "brel preview-comment",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::Changelogen,
                 tagging_enabled: false,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -336,12 +379,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
+                preview_comment_command: "brel preview-comment",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: true,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -372,12 +417,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag --config custom.toml",
+                preview_comment_command: "brel preview-comment --config custom.toml",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: true,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -397,12 +444,14 @@ mod tests {
                 release_pr_command: "brel release-pr --config custom.toml",
                 changelog_command: "brel changelog --config custom.toml",
                 tag_command: "brel tag --config custom.toml",
+                preview_comment_command: "brel preview-comment --config custom.toml",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: false,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -435,12 +484,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
+                preview_comment_command: "brel preview-comment",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::Changelogen,
                 tagging_enabled: false,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -460,12 +511,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag --config custom.toml",
+                preview_comment_command: "brel preview-comment --config custom.toml",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: false,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: true,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -487,12 +540,14 @@ mod tests {
                 release_pr_command: "brel release-pr --config custom.toml",
                 changelog_command: "brel changelog --config custom.toml",
                 tag_command: "brel tag --config custom.toml",
+                preview_comment_command: "brel preview-comment --config custom.toml",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: false,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -525,12 +580,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag",
+                preview_comment_command: "brel preview-comment",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: true,
                 changelog_provider: ChangelogProvider::Changelogen,
                 tagging_enabled: false,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -550,12 +607,14 @@ mod tests {
                 release_pr_command: "brel release-pr",
                 changelog_command: "brel changelog",
                 tag_command: "brel tag --config custom.toml",
+                preview_comment_command: "brel preview-comment --config custom.toml",
                 github_token_expr: "${{ github.token }}",
                 forgejo_token_expr: "${{ forgejo.token }}",
                 tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
                 changelog_enabled: false,
                 changelog_provider: ChangelogProvider::GitCliff,
                 tagging_enabled: true,
+                preview_comment_enabled: false,
             },
         )
         .unwrap();
@@ -572,6 +631,123 @@ mod tests {
         assert!(rendered.contains("Validate tag push token"));
         assert!(rendered.contains("BREL_TAG_PUSH_TOKEN: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
         assert!(rendered.contains("token: ${{ secrets.BREL_TAG_PUSH_TOKEN }}"));
+    }
+
+    #[test]
+    fn can_enable_github_preview_comment_job() {
+        let rendered = render_workflow(
+            Provider::Github,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                changelog_command: "brel changelog",
+                tag_command: "brel tag",
+                preview_comment_command: "brel preview-comment",
+                github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
+                changelog_enabled: true,
+                changelog_provider: ChangelogProvider::GitCliff,
+                tagging_enabled: false,
+                preview_comment_enabled: true,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("preview-comment:"));
+        assert!(rendered.contains("run: brel preview-comment"));
+        assert!(rendered.contains("- opened"));
+        assert!(rendered.contains("- synchronize"));
+        assert!(rendered.contains("- reopened"));
+        assert!(!rendered.contains("- closed"));
+        assert!(rendered.contains("github.event.action != 'closed'"));
+        assert!(
+            rendered.contains("github.event.pull_request.head.repo.full_name == github.repository")
+        );
+        assert!(rendered.contains("fetch-depth: 0"));
+        assert_eq!(rendered.matches("pull_request:").count(), 1);
+    }
+
+    #[test]
+    fn combines_tagging_and_preview_comment_pull_request_triggers() {
+        let rendered = render_workflow(
+            Provider::Github,
+            WorkflowTemplate::ReleasePr,
+            &WorkflowRenderContext {
+                default_branch: "main",
+                release_pr_command: "brel release-pr",
+                changelog_command: "brel changelog",
+                tag_command: "brel tag",
+                preview_comment_command: "brel preview-comment",
+                github_token_expr: "${{ github.token }}",
+                forgejo_token_expr: "${{ forgejo.token }}",
+                tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
+                changelog_enabled: true,
+                changelog_provider: ChangelogProvider::GitCliff,
+                tagging_enabled: true,
+                preview_comment_enabled: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rendered.matches("pull_request:").count(), 1);
+        assert!(rendered.contains("- closed"));
+        assert!(rendered.contains("- opened"));
+        assert!(rendered.contains("release-tag:"));
+        assert!(rendered.contains("preview-comment:"));
+    }
+
+    #[test]
+    fn renders_preview_comment_with_versions() {
+        let rendered = render_preview_comment(&PreviewCommentContext {
+            projected_version: Some("1.3.0"),
+            projected_tag: Some("v1.3.0"),
+            current_version: Some("1.2.0"),
+            base_branch: "main",
+            forced_note: None,
+        })
+        .unwrap();
+
+        assert!(rendered.contains(PREVIEW_COMMENT_MARKER));
+        assert!(!rendered.contains(MANAGED_RELEASE_PR_MARKER));
+        assert!(rendered.contains("from `1.2.0`"));
+        assert!(rendered.contains("**`1.3.0`**"));
+        assert!(rendered.contains("(tag `v1.3.0`)"));
+        assert!(rendered.contains("`main`"));
+        assert!(!rendered.contains("would not produce a release"));
+    }
+
+    #[test]
+    fn renders_preview_comment_without_current_version_or_with_forced_note() {
+        let rendered = render_preview_comment(&PreviewCommentContext {
+            projected_version: Some("0.1.0"),
+            projected_tag: Some("v0.1.0"),
+            current_version: None,
+            base_branch: "main",
+            forced_note: Some("Version 0.1.0 forced by --release-as flag."),
+        })
+        .unwrap();
+
+        assert!(!rendered.contains("from `"));
+        assert!(rendered.contains("**`0.1.0`**"));
+        assert!(rendered.contains("Version 0.1.0 forced by --release-as flag."));
+    }
+
+    #[test]
+    fn renders_preview_comment_no_release_variant() {
+        let rendered = render_preview_comment(&PreviewCommentContext {
+            projected_version: None,
+            projected_tag: None,
+            current_version: None,
+            base_branch: "main",
+            forced_note: None,
+        })
+        .unwrap();
+
+        assert!(rendered.contains(PREVIEW_COMMENT_MARKER));
+        assert!(rendered.contains("would not produce a release"));
+        assert!(!rendered.contains("**`"));
     }
 
     #[test]
