@@ -921,6 +921,124 @@ fn dry_run_prints_diff_and_does_not_write() {
     assert_eq!(content, "# managed-by: brel\nname: old\n");
 }
 
+#[test]
+fn preview_comment_posts_projected_version_comment() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.preview_comment]
+enabled = true
+"#,
+    )
+    .unwrap();
+    run_git(temp_dir.path(), &["add", "brel.toml"]);
+    run_git(temp_dir.path(), &["commit", "-m", "chore: add config"]);
+    run_git(temp_dir.path(), &["tag", "v1.0.0"]);
+
+    fs::write(temp_dir.path().join("feature.txt"), "feat").unwrap();
+    run_git(temp_dir.path(), &["add", "feature.txt"]);
+    run_git(temp_dir.path(), &["commit", "-m", "feat: add feature"]);
+
+    let event_path = temp_dir.path().join("event.json");
+    fs::write(
+        &event_path,
+        r#"{ "pull_request": { "number": 12, "merged": false, "body": "A contributor PR" } }"#,
+    )
+    .unwrap();
+
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_command(
+        &bin_dir.join("gh"),
+        r#"printf '%s\n' "$@" >> "$BREL_FAKE_ARGS"
+case "$*" in *per_page*) echo "[]";; esac"#,
+    );
+    let args_file = temp_dir.path().join("gh.args");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("preview-comment")
+        .env("PATH", prepend_path(&bin_dir))
+        .env("BREL_FAKE_ARGS", &args_file)
+        .env("GH_TOKEN", "test-token")
+        .env("GITHUB_EVENT_PATH", &event_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Posted release preview comment on PR #12: next version 1.1.0.",
+        ));
+
+    let recorded_args = fs::read_to_string(args_file).unwrap();
+    assert!(recorded_args.contains("repos/{owner}/{repo}/issues/12/comments?per_page=100"));
+    assert!(recorded_args.contains("<!-- brel: preview-comment -->"));
+    assert!(recorded_args.contains("`1.1.0`"));
+    assert!(recorded_args.contains("from `1.0.0`"));
+}
+
+#[test]
+fn preview_comment_skips_brel_managed_pr_event() {
+    let temp_dir = tempdir().unwrap();
+    init_git_repo(temp_dir.path());
+
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.preview_comment]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let event_path = temp_dir.path().join("event.json");
+    fs::write(
+        &event_path,
+        r#"{ "pull_request": { "number": 12, "merged": false, "body": "<!-- managed-by: brel -->\n## Release v1.1.0" } }"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .arg("preview-comment")
+        .env("GH_TOKEN", "test-token")
+        .env("GITHUB_EVENT_PATH", &event_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "PR is managed by brel. Skipping preview comment.",
+        ));
+}
+
+#[test]
+fn init_with_enabled_preview_comment_adds_preview_job() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join("brel.toml"),
+        r#"
+[release_pr.preview_comment]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("brel"));
+    cmd.current_dir(temp_dir.path())
+        .args(["init", "--yes"])
+        .assert()
+        .success();
+
+    let workflow = temp_dir.path().join(".github/workflows/release-pr.yml");
+    let content = fs::read_to_string(workflow).unwrap();
+    assert!(content.contains("pull_request:"));
+    assert!(content.contains("- opened"));
+    assert!(content.contains("- synchronize"));
+    assert!(content.contains("- reopened"));
+    assert!(content.contains("preview-comment:"));
+    assert!(content.contains("run: brel preview-comment"));
+}
+
 fn init_git_repo(path: &std::path::Path) {
     run_git(path, &["init", "-q"]);
     run_git(path, &["config", "user.name", "Test User"]);

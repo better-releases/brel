@@ -18,6 +18,7 @@ pub const DEFAULT_COMMIT_AUTHOR_EMAIL: &str = "brel[bot]@users.noreply.github.co
 pub const DEFAULT_CHANGELOG_OUTPUT_FILE: &str = "CHANGELOG.md";
 pub const DEFAULT_CHANGELOGEN_VERSION: &str = "0.6.2";
 pub const DEFAULT_TAGGING_ENABLED: bool = false;
+pub const DEFAULT_PREVIEW_COMMENT_ENABLED: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -265,6 +266,11 @@ pub struct TaggingConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewCommentConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleasePrConfig {
     pub version_updates: BTreeMap<String, Vec<String>>,
     pub format_overrides: BTreeMap<String, VersionFileFormat>,
@@ -275,6 +281,7 @@ pub struct ReleasePrConfig {
     pub commit_author: CommitAuthorConfig,
     pub changelog: ChangelogConfig,
     pub tagging: TaggingConfig,
+    pub preview_comment: PreviewCommentConfig,
 }
 
 impl Default for ReleasePrConfig {
@@ -301,6 +308,9 @@ impl Default for ReleasePrConfig {
             tagging: TaggingConfig {
                 enabled: DEFAULT_TAGGING_ENABLED,
                 tag_template: tag_template::DEFAULT_TAG_TEMPLATE.to_string(),
+            },
+            preview_comment: PreviewCommentConfig {
+                enabled: DEFAULT_PREVIEW_COMMENT_ENABLED,
             },
         }
     }
@@ -335,6 +345,7 @@ struct RawReleasePrConfig {
     commit_author: Option<RawCommitAuthorConfig>,
     changelog: Option<RawChangelogConfig>,
     tagging: Option<RawTaggingConfig>,
+    preview_comment: Option<RawPreviewCommentConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -360,6 +371,11 @@ struct RawChangelogenConfig {
 struct RawTaggingConfig {
     enabled: Option<bool>,
     tag_template: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawPreviewCommentConfig {
+    enabled: Option<bool>,
 }
 
 pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> {
@@ -392,7 +408,7 @@ pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> 
         let path = source.path().expect("config source always has path");
         format!("Config file `{}` is not valid TOML.", path.display())
     })?;
-    let warnings = collect_warnings(&parsed_toml);
+    let mut warnings = collect_warnings(&parsed_toml);
 
     let raw: RawConfig = toml::from_str(&raw_contents).with_context(|| {
         let path = source.path().expect("config source always has path");
@@ -427,6 +443,14 @@ pub fn load(explicit_path: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig> 
 
     let release_pr = resolve_release_pr_config(raw.release_pr)?;
 
+    if release_pr.preview_comment.enabled && provider != Provider::Github {
+        warnings.push(
+            "`release_pr.preview_comment` is only supported for provider `github` and will be \
+             ignored."
+                .to_string(),
+        );
+    }
+
     Ok(ResolvedConfig {
         provider,
         default_branch,
@@ -459,6 +483,7 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         commit_author,
         changelog,
         tagging,
+        preview_comment,
     } = raw_release_pr;
     let version_updates = resolve_version_updates(version_updates)?;
     let format_overrides = resolve_format_overrides(format_overrides, &version_updates)?;
@@ -477,6 +502,7 @@ fn resolve_release_pr_config(raw: Option<RawReleasePrConfig>) -> Result<ReleaseP
         commit_author: resolve_commit_author(commit_author)?,
         changelog: resolve_changelog_config(changelog)?,
         tagging: resolve_tagging_config(tagging)?,
+        preview_comment: resolve_preview_comment_config(preview_comment),
     })
 }
 
@@ -624,6 +650,16 @@ fn resolve_tagging_config(raw: Option<RawTaggingConfig>) -> Result<TaggingConfig
     })
 }
 
+fn resolve_preview_comment_config(raw: Option<RawPreviewCommentConfig>) -> PreviewCommentConfig {
+    let raw_preview_comment = raw.unwrap_or_default();
+
+    PreviewCommentConfig {
+        enabled: raw_preview_comment
+            .enabled
+            .unwrap_or(DEFAULT_PREVIEW_COMMENT_ENABLED),
+    }
+}
+
 fn normalize_repo_relative_path(value: &str, label: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -731,6 +767,7 @@ fn collect_warnings(parsed: &toml::Value) -> Vec<String> {
         "commit_author",
         "changelog",
         "tagging",
+        "preview_comment",
     ]);
     for key in release_pr
         .keys()
@@ -798,6 +835,21 @@ fn collect_release_pr_nested_warnings(
         {
             warnings.push(format!(
                 "Unknown config key `release_pr.tagging.{key}` was ignored."
+            ));
+        }
+    }
+
+    if let Some(preview_comment) = release_pr
+        .get("preview_comment")
+        .and_then(toml::Value::as_table)
+    {
+        let allowed_preview_comment: BTreeSet<&str> = BTreeSet::from(["enabled"]);
+        for key in preview_comment
+            .keys()
+            .filter(|key| !allowed_preview_comment.contains(key.as_str()))
+        {
+            warnings.push(format!(
+                "Unknown config key `release_pr.preview_comment.{key}` was ignored."
             ));
         }
     }
@@ -1323,6 +1375,74 @@ tag_template = "{{version}}"
         let config = load(None, cwd).unwrap();
         assert!(config.release_pr.tagging.enabled);
         assert_eq!(config.release_pr.tagging.tag_template, "{version}");
+    }
+
+    #[test]
+    fn preview_comment_defaults_to_disabled() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(cwd.join("brel.toml"), "[release_pr]\n").unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert!(!config.release_pr.preview_comment.enabled);
+        assert!(config.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_release_pr_preview_comment_settings() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.preview_comment]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert!(config.release_pr.preview_comment.enabled);
+        assert!(config.warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_on_unknown_preview_comment_keys() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+[release_pr.preview_comment]
+enabled = true
+extra = 1
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(config.warnings.len(), 1);
+        assert!(config.warnings[0].contains("release_pr.preview_comment.extra"));
+    }
+
+    #[test]
+    fn warns_when_preview_comment_enabled_for_non_github_provider() {
+        let temp_dir = tempdir().unwrap();
+        let cwd = temp_dir.path();
+        fs::write(
+            cwd.join("brel.toml"),
+            r#"
+provider = "gitlab"
+
+[release_pr.preview_comment]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let config = load(None, cwd).unwrap();
+        assert_eq!(config.warnings.len(), 1);
+        assert!(config.warnings[0].contains("only supported for provider `github`"));
     }
 
     #[test]

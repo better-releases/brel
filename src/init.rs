@@ -291,6 +291,7 @@ fn render_release_workflow(
     let release_pr_command = build_release_pr_command(config_path);
     let changelog_command = build_changelog_command(config_path);
     let tag_command = build_tag_command(config_path);
+    let preview_comment_command = build_preview_comment_command(config_path);
     template::render_workflow(
         config.provider,
         WorkflowTemplate::ReleasePr,
@@ -299,12 +300,15 @@ fn render_release_workflow(
             release_pr_command: &release_pr_command,
             changelog_command: &changelog_command,
             tag_command: &tag_command,
+            preview_comment_command: &preview_comment_command,
             github_token_expr: "${{ github.token }}",
             forgejo_token_expr: "${{ forgejo.token }}",
             tagging_push_token_expr: "${{ secrets.BREL_TAG_PUSH_TOKEN }}",
             changelog_enabled: config.release_pr.changelog.enabled,
             changelog_provider: config.release_pr.changelog.provider,
             tagging_enabled: config.release_pr.tagging.enabled,
+            preview_comment_enabled: config.provider == Provider::Github
+                && config.release_pr.preview_comment.enabled,
         },
     )
 }
@@ -738,6 +742,10 @@ fn build_changelog_command(explicit_config_path: Option<&Path>) -> String {
 
 fn build_tag_command(explicit_config_path: Option<&Path>) -> String {
     build_brel_command("tag", explicit_config_path)
+}
+
+fn build_preview_comment_command(explicit_config_path: Option<&Path>) -> String {
+    build_brel_command("preview-comment", explicit_config_path)
 }
 
 fn build_brel_command(subcommand: &str, explicit_config_path: Option<&Path>) -> String {

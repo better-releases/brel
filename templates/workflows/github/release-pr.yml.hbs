@@ -6,10 +6,17 @@ on:
   push:
     branches:
       - {{default_branch}}
-{{#if tagging_enabled}}
+{{#if pull_request_trigger_enabled}}
   pull_request:
     types:
+{{#if tagging_enabled}}
       - closed
+{{/if}}
+{{#if preview_comment_enabled}}
+      - opened
+      - synchronize
+      - reopened
+{{/if}}
     branches:
       - {{default_branch}}
 {{/if}}
@@ -81,4 +88,24 @@ jobs:
 
       - name: Create release tag
         run: {{tag_command}}
+{{/if}}
+{{#if preview_comment_enabled}}
+
+  preview-comment:
+    # Same-repo PRs only: fork PRs get a read-only token that cannot post comments.
+    if: github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install brel
+        uses: better-releases/setup-brel@v1
+
+      - name: Post release preview comment
+        env:
+          GH_TOKEN: {{github_token_expr}}
+        run: {{preview_comment_command}}
 {{/if}}

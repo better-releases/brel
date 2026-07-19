@@ -29,6 +29,7 @@ fn run() -> Result<()> {
         Commands::ReleasePr(args) => release_pr::run(&args),
         Commands::Tag(args) => release_pr::run_tag(&args),
         Commands::NextVersion(args) => release_pr::run_next_version(&args),
+        Commands::PreviewComment(args) => release_pr::run_preview_comment(&args),
         Commands::Validate(args) => validate::run(&args),
     }
 }
