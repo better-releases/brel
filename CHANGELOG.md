@@ -1,3 +1,13 @@
+## [0.14.0] - 2026-07-19
+
+### 🚀 Features
+
+- Next release commit
+
+### ⚙️ Miscellaneous Tasks
+
+- Update test to use the same clippy args as commit hook
+- Comply with stricter clippy
 ## [0.13.0] - 2026-07-18
 
 ### 🚀 Features
