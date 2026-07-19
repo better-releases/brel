@@ -1,3 +1,14 @@
+## [0.13.0] - 2026-07-18
+
+### 🚀 Features
+
+- Release-as override
+- Bump minor-path pre major
+
+### ⚙️ Miscellaneous Tasks
+
+- Update lefthook config
+- Fix clippy issues
 ## [0.12.0] - 2026-07-08
 
 ### 🚀 Features
