@@ -914,7 +914,7 @@ mod tests {
             .current_dir(repo_root)
             .status()
             .unwrap();
-        assert!(status.success(), "git {:?} failed", args);
+        assert!(status.success(), "git {args:?} failed");
     }
 
     fn set_origin_head(repo_root: &Path, branch: &str) {
@@ -1160,10 +1160,10 @@ enabled = true
         let temp_dir = tempdir().unwrap();
         fs::write(
             temp_dir.path().join("brel.toml"),
-            r#"
+            r"
 [release_pr.changelog]
 enabled = false
-"#,
+",
         )
         .unwrap();
         let mut interactor = MockInteractor::default();
@@ -1211,10 +1211,10 @@ output_file = "docs/changelog.md"
         let temp_dir = tempdir().unwrap();
         fs::write(
             temp_dir.path().join("brel.toml"),
-            r#"
+            r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
         )
         .unwrap();
         let mut interactor = MockInteractor::default();

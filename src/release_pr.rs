@@ -2221,8 +2221,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"headRefName":"brel/release/v1.3.0","body":"{}\nold body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"headRefName":"brel/release/v1.3.0","body":"{MANAGED_RELEASE_PR_MARKER}\nold body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -2273,8 +2272,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nold body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{MANAGED_RELEASE_PR_MARKER}\nold body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -2364,8 +2362,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nold body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{MANAGED_RELEASE_PR_MARKER}\nold body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -2420,8 +2417,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nold body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{MANAGED_RELEASE_PR_MARKER}\nold body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -2474,8 +2470,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nstale body"}},{{"number":8,"headRefName":"brel/release/v1.2.5","body":"{}\nnewer stale body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER, MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{MANAGED_RELEASE_PR_MARKER}\nstale body"}},{{"number":8,"headRefName":"brel/release/v1.2.5","body":"{MANAGED_RELEASE_PR_MARKER}\nnewer stale body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -2543,8 +2538,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{}\nstale body"}},{{"number":8,"headRefName":"brel/release/v1.3.0","body":"{}\ncurrent body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER, MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"headRefName":"brel/release/v1.2.4","body":"{MANAGED_RELEASE_PR_MARKER}\nstale body"}},{{"number":8,"headRefName":"brel/release/v1.3.0","body":"{MANAGED_RELEASE_PR_MARKER}\ncurrent body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -2671,10 +2665,10 @@ tag_template = "release-{version}"
         let temp_dir = tempdir().unwrap();
         fs::write(
             temp_dir.path().join("brel.toml"),
-            r#"
+            r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
         )
         .unwrap();
         let event_path = write_pull_request_event(
@@ -2704,10 +2698,10 @@ enabled = true
         let temp_dir = tempdir().unwrap();
         fs::write(
             temp_dir.path().join("brel.toml"),
-            r#"
+            r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
         )
         .unwrap();
         let event_path = write_pull_request_event(
@@ -2737,10 +2731,10 @@ enabled = true
         let temp_dir = tempdir().unwrap();
         fs::write(
             temp_dir.path().join("brel.toml"),
-            r#"
+            r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
         )
         .unwrap();
         let event_path = write_pull_request_event(
@@ -2778,10 +2772,10 @@ enabled = true
         let temp_dir = tempdir().unwrap();
         fs::write(
             temp_dir.path().join("brel.toml"),
-            r#"
+            r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
         )
         .unwrap();
         let event_path = write_pull_request_event(
@@ -2869,8 +2863,7 @@ enabled = true
         )
         .unwrap();
         let managed_mr_json = format!(
-            r#"[{{"iid":7,"title":"Release v1.2.3","description":"{}\nrelease body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"iid":7,"title":"Release v1.2.3","description":"{MANAGED_RELEASE_PR_MARKER}\nrelease body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![ok(""), status(1), ok(""), ok("")]);
         let mut gitlab = ScriptedGitlabClient::new(vec![http_ok(&managed_mr_json)]);
@@ -3108,13 +3101,13 @@ version = "1.2.3"
         .unwrap();
         fs::write(
             temp_dir.path().join("release.yaml"),
-            r#"
+            r"
 packages:
   - name: dep
     version: 0.9.0
   - name: brel
     version: 1.2.3
-"#,
+",
         )
         .unwrap();
 
@@ -3520,8 +3513,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_mr_json = format!(
-            r#"[{{"iid":7,"source_branch":"brel/release/v1.3.0","description":"{}\nold body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"iid":7,"source_branch":"brel/release/v1.3.0","description":"{MANAGED_RELEASE_PR_MARKER}\nold body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -3581,8 +3573,7 @@ default_branch = "main"
         .unwrap();
 
         let stale_mr_json = format!(
-            r#"[{{"iid":7,"source_branch":"brel/release/v1.2.4","description":"{}\nstale body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"iid":7,"source_branch":"brel/release/v1.2.4","description":"{MANAGED_RELEASE_PR_MARKER}\nstale body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -3737,8 +3728,7 @@ default_branch = "main"
         .unwrap();
 
         let existing_pr_json = format!(
-            r#"[{{"number":7,"head":{{"ref":"brel/release/v1.3.0"}},"body":"{}\nold body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"head":{{"ref":"brel/release/v1.3.0"}},"body":"{MANAGED_RELEASE_PR_MARKER}\nold body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),
@@ -3806,8 +3796,7 @@ default_branch = "main"
         .unwrap();
 
         let stale_pr_json = format!(
-            r#"[{{"number":7,"head_branch":"brel/release/v1.2.4","body":"{}\nstale body"}}]"#,
-            MANAGED_RELEASE_PR_MARKER
+            r#"[{{"number":7,"head_branch":"brel/release/v1.2.4","body":"{MANAGED_RELEASE_PR_MARKER}\nstale body"}}]"#
         );
         let mut runner = ScriptedRunner::new(vec![
             ok("v1.2.3\n"),

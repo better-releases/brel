@@ -1394,10 +1394,10 @@ tag_template = "{{version}}"
         let cwd = temp_dir.path();
         fs::write(
             cwd.join("brel.toml"),
-            r#"
+            r"
 [release_pr.preview_comment]
 enabled = true
-"#,
+",
         )
         .unwrap();
 
@@ -1412,11 +1412,11 @@ enabled = true
         let cwd = temp_dir.path();
         fs::write(
             cwd.join("brel.toml"),
-            r#"
+            r"
 [release_pr.preview_comment]
 enabled = true
 extra = 1
-"#,
+",
         )
         .unwrap();
 

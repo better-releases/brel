@@ -316,10 +316,10 @@ fn changelog_disabled_exits_successfully() {
     let temp_dir = tempdir().unwrap();
     fs::write(
         temp_dir.path().join("brel.toml"),
-        r#"
+        r"
 [release_pr.changelog]
 enabled = false
-"#,
+",
     )
     .unwrap();
 
@@ -726,10 +726,10 @@ fn init_with_disabled_changelog_omits_git_cliff_step() {
     let temp_dir = tempdir().unwrap();
     fs::write(
         temp_dir.path().join("brel.toml"),
-        r#"
+        r"
 [release_pr.changelog]
 enabled = false
-"#,
+",
     )
     .unwrap();
 
@@ -791,10 +791,10 @@ fn init_with_enabled_tagging_adds_tag_job() {
     let temp_dir = tempdir().unwrap();
     fs::write(
         temp_dir.path().join("brel.toml"),
-        r#"
+        r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
     )
     .unwrap();
 
@@ -822,10 +822,10 @@ fn init_with_custom_config_forwards_config_to_workflow_commands() {
     let temp_dir = tempdir().unwrap();
     fs::write(
         temp_dir.path().join("release.toml"),
-        r#"
+        r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
     )
     .unwrap();
 
@@ -847,10 +847,10 @@ fn init_with_enabled_tagging_dry_run_prints_pat_notice() {
     let temp_dir = tempdir().unwrap();
     fs::write(
         temp_dir.path().join("brel.toml"),
-        r#"
+        r"
 [release_pr.tagging]
 enabled = true
-"#,
+",
     )
     .unwrap();
 
@@ -928,10 +928,10 @@ fn preview_comment_posts_projected_version_comment() {
 
     fs::write(
         temp_dir.path().join("brel.toml"),
-        r#"
+        r"
 [release_pr.preview_comment]
 enabled = true
-"#,
+",
     )
     .unwrap();
     run_git(temp_dir.path(), &["add", "brel.toml"]);
@@ -985,10 +985,10 @@ fn preview_comment_skips_brel_managed_pr_event() {
 
     fs::write(
         temp_dir.path().join("brel.toml"),
-        r#"
+        r"
 [release_pr.preview_comment]
 enabled = true
-"#,
+",
     )
     .unwrap();
 
@@ -1016,10 +1016,10 @@ fn init_with_enabled_preview_comment_adds_preview_job() {
     let temp_dir = tempdir().unwrap();
     fs::write(
         temp_dir.path().join("brel.toml"),
-        r#"
+        r"
 [release_pr.preview_comment]
 enabled = true
-"#,
+",
     )
     .unwrap();
 
